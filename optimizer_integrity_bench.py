@@ -27,17 +27,30 @@ from collections import Counter
 
 import numpy as np
 
-# Shared measurement + comparison primitives now live in tripwire.measure
-# (single source of truth -- task 1.1). The seed stays runnable as a smoke test.
-from tripwire.measure import close_equal, speedup
-
-# The oracle (Verdict + naive/layered) now lives in tripwire.oracle (task 1.2).
-from tripwire.oracle import layered_oracle, naive_oracle
-
+# Shared measurement + comparison primitives live in tripwire.measure (task 1.1).
+# The oracle (Verdict + naive/layered) lives in tripwire.oracle (task 1.2).
 # Interface A (Target) is frozen in tripwire.target (task 1.3).
+# Interface B (the OpenEvolve adapter) is frozen in tripwire.evaluator (task 1.4),
+# re-exported here so the seed stays a faithful end-to-end surface (its docstring
+# promises "exposes that oracle as an OpenEvolve evaluator").
+from tripwire.evaluator import make_openevolve_evaluator
+from tripwire.measure import close_equal, speedup
+from tripwire.oracle import layered_oracle, naive_oracle
 from tripwire.target import Target
 
 RNG = np.random.default_rng
+
+__all__ = [
+    "Target",
+    "layered_oracle",
+    "naive_oracle",
+    "make_openevolve_evaluator",
+    "run_bench",
+    "evaluate_candidate",
+    "make_word_freq_target",
+    "make_sum_target",
+    "make_seed_target",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -194,25 +207,11 @@ def run_bench():
 # ---------------------------------------------------------------------------
 # OpenEvolve integration: the same layered oracle as a drop-in evaluator.
 # Correctness failures ZERO the score, so the evolver cannot be rewarded for
-# fast-but-wrong code. Wire this as evaluator.py; run on a box with network +
-# an LLM key. Target zero = the COMPILOT-with-Claude reproduction.
+# fast-but-wrong code. Now lives in tripwire.evaluator (Interface B, task 1.4);
+# make_openevolve_evaluator is imported at the top and re-exported via __all__ so
+# the seed stays a faithful end-to-end smoke test.
+# Run on a box with network + an LLM key; target zero = COMPILOT-with-Claude.
 # ---------------------------------------------------------------------------
-def make_openevolve_evaluator(target: Target):
-    def evaluator(program_path: str) -> dict:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("candidate", program_path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        cand = getattr(mod, "solve", None) or getattr(mod, target.name, None)
-        if cand is None:
-            return {"combined_score": 0.0, "correct": 0.0, "speedup": 0.0,
-                    "reason": "no entrypoint"}
-        v = layered_oracle(target, cand)
-        if not v.accepted:                      # reward hacking / wrong -> no reward, period
-            return {"combined_score": 0.0, "correct": 0.0, "speedup": 0.0, "reason": v.reason}
-        sp = 0.0 if math.isinf(v.speedup) else v.speedup
-        return {"combined_score": sp, "correct": 1.0, "speedup": sp, "reason": v.reason}
-    return evaluator
 
 
 if __name__ == "__main__":

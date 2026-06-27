@@ -3,7 +3,10 @@ name = "tripwire"
 version = "0.1.0"
 description = "A layered, adversarial-by-design correctness oracle for LLM-driven code optimization, packaged as a drop-in OpenEvolve evaluator."
 readme = "README.md"
-requires-python = ">=3.11"
+# 3.12+: the Phase-0 seed uses 3.12 f-string syntax (nested same-quote f-strings),
+# and the .venv this repo runs on is 3.12. CLAUDE.md §7 says "3.11+"; we tighten the
+# real floor to 3.12 so the declared floor matches what actually parses/runs.
+requires-python = ">=3.12"
 dependencies = [
     "numpy",
 ]
@@ -12,6 +15,14 @@ dependencies = [
 dev = [
     "pytest",
     "ruff",
+]
+# The OpenEvolve loop is needed only by the runner script (tripwire/evaluator.py
+# returns a plain dict and imports nothing from openevolve, so the core stays
+# dependency-light -- see ADR-001/HARD RULE 1). Pinned to the confirmed-latest
+# canonical release (algorithmicsuperintelligence/openevolve == codelion/openevolve,
+# v0.2.27, the version on PyPI). Network + an LLM key required to actually run it.
+runner = [
+    "openevolve>=0.2.27",
 ]
 
 [build-system]
@@ -24,10 +35,20 @@ py-modules = ["optimizer_integrity_bench"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
+# docs/ holds a verbatim upstream OpenEvolve reference (openevolve-example-evaluator.py)
+# kept for ADR-007 fidelity -- it is third-party documentation, not our source, so it
+# is excluded from our lint.
+extend-exclude = ["docs/"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+# The Phase-0 seed (optimizer_integrity_bench.py) is FROZEN (CLAUDE.md §6); its body is
+# intentionally not reformatted to protect the regression baseline. We silence the
+# pre-existing body-style lints there but KEEP import hygiene (F/I) enforced so a future
+# orphaned import is still caught.
+[tool.ruff.lint.per-file-ignores]
+"optimizer_integrity_bench.py" = ["E501", "E731"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
