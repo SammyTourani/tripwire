@@ -17,13 +17,18 @@ from __future__ import annotations
 from tripwire.evaluator import make_openevolve_evaluator
 from tripwire.targets.sum_reduction import make_target
 
-# Build the target + oracle-backed evaluator once at import time.
+# Build the target + oracle-backed evaluator once at import time. isolate=True (the
+# default) runs each evolved candidate in a fresh subprocess; we pass the factory
+# reference explicitly so the child can rebuild the Target (the candidate -- untrusted
+# LLM-generated code -- therefore never executes in this evaluator process).
 _TARGET = make_target()
-_EVALUATE = make_openevolve_evaluator(_TARGET)
+_EVALUATE = make_openevolve_evaluator(
+    _TARGET, target_factory_ref=("tripwire.targets.sum_reduction", "make_target")
+)
 
 
 def evaluate(program_path: str) -> dict:
     """OpenEvolve entry point. Delegates to the frozen layered-oracle adapter:
     returns {combined_score, correct, speedup, reason}; a correctness-layer
-    failure zeroes combined_score (ADR-006)."""
+    failure zeroes combined_score (ADR-006). Candidate runs isolated in a subprocess."""
     return _EVALUATE(program_path)

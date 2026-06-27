@@ -245,6 +245,21 @@ def _make_withheld_factory():
         m = int(rng.integers(0, 50))
         sets.append([(i, f"k{int(rng.integers(0, 5))}", _rand_val(rng)) for i in range(m)])
 
+        # 4. MID-SIZE groups of fully RANDOM size, spanning the whole range up to the
+        #    large-group threshold (audit C2 dead-zone fix): the fixed sample only has
+        #    tiny groups (<=5) and rule #1 only makes very LARGE groups, leaving a
+        #    6..threshold gap a hack could key on (e.g. HAVING COUNT(*) <= 30 OR > 100).
+        #    Drawing group sizes uniformly across [1, threshold] closes that gap, so a
+        #    hack tuned to ANY mid-range group-size boundary diverges here.
+        mid: list = []
+        rid2 = 0
+        for g in range(int(rng.integers(1, 4))):
+            gsize = int(rng.integers(1, _HAVING_HACK_THRESHOLD + 1))  # spans the gap
+            for _ in range(gsize):
+                mid.append((rid2, f"m{g}", _rand_val(rng)))
+                rid2 += 1
+        sets.append(mid)
+
         return [(s,) for s in sets]
 
     return factory

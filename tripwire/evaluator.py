@@ -33,8 +33,7 @@ import importlib.util
 import math
 from collections.abc import Callable
 
-from tripwire.isolation import DEFAULT_TIMEOUT, IsolatedCandidate
-from tripwire.measure import speedup
+from tripwire.isolation import DEFAULT_TIMEOUT, evaluate_isolated
 from tripwire.oracle import layered_oracle
 from tripwire.target import Target
 
@@ -51,10 +50,9 @@ def _zero(reason: str) -> dict:
 
 
 def _load_candidate(program_path: str, target: Target) -> Callable | None:
-    """Import the evolved program IN-PROCESS and return its entrypoint, or None if it
-    cannot be loaded or exposes no entrypoint. Used only for the trusted/timing path;
-    the security-critical correctness check runs in isolation (see make_..._evaluator).
-    A program that raises at import time must NOT crash the evaluator."""
+    """Import the evolved program IN-PROCESS and return its entrypoint, or None.
+    Used only by the isolate=False trusted path; the hardened default never imports
+    the candidate in this process at all."""
     spec = importlib.util.spec_from_file_location("candidate", program_path)
     if spec is None or spec.loader is None:
         return None
@@ -64,7 +62,11 @@ def _load_candidate(program_path: str, target: Target) -> Callable | None:
 
 
 def make_openevolve_evaluator(
-    target: Target, *, isolate: bool = True, timeout: float = DEFAULT_TIMEOUT
+    target: Target,
+    *,
+    isolate: bool = True,
+    timeout: float = DEFAULT_TIMEOUT,
+    target_factory_ref: tuple[str, str] | None = None,
 ) -> Callable[[str], dict]:
     """Build the OpenEvolve evaluator for `target`.
 
@@ -75,44 +77,40 @@ def make_openevolve_evaluator(
       speedup        : measured speedup (== combined_score on success), 0.0 otherwise.
       reason         : human-readable verdict / failing layer.
 
-    SECURITY (isolate=True, the default): the candidate is loaded and CALLED in a
-    fresh subprocess (tripwire.isolation), and the layered oracle compares its
-    outputs against the reference in THIS clean process. The candidate therefore
-    never executes in the evaluator's interpreter during the correctness check, so it
-    cannot monkeypatch the oracle's comparators to mark its own homework (audit C1),
-    nor corrupt shared inputs (H1). Only AFTER correctness passes all layers is the
-    candidate run in-process to MEASURE speedup -- by then it is already proven
-    correct, so the worst a tampering candidate can do is inflate its own (already
-    earned) speed number, never earn reward for wrong code.
+    SECURITY (isolate=True, the default): the ENTIRE evaluation -- loading the
+    candidate, running the layered oracle, and measuring speedup -- happens in a
+    fresh 'spawn' subprocess. The subprocess returns ONLY primitives
+    (accepted, reason, speedup); the parent deserializes nothing the candidate
+    controls. Therefore the candidate never executes in the evaluator's process and
+    cannot (a) monkeypatch the oracle, (b) run code in the parent via a malicious
+    pickle `__reduce__`, or (c) corrupt inputs/state for later candidates. Inside the
+    child, the oracle's comparators/speedup are captured as default args before the
+    candidate loads, so even in-child monkeypatching cannot fake a verdict.
 
-    isolate=False runs the candidate in-process throughout (the original trusted
-    path) -- use only for trusted code / tests, never for untrusted evolved programs.
+    To run in the subprocess, the child must REBUILD the Target from a zero-arg
+    factory named by `target_factory_ref=('module', 'attr')`. If not provided, it is
+    inferred from `target` when possible (e.g. tripwire.targets.<name>.make_target);
+    pass it explicitly for custom targets.
+
+    isolate=False runs the candidate in-process (the original trusted path) -- use
+    only for trusted code / tests, never for untrusted evolved programs.
 
     The returned callable is exposed both as `evaluate` (OpenEvolve naming) and via
     the `.evaluator` attribute (CLAUDE.md Interface B wording).
     """
     entrypoints = [CANONICAL_ENTRYPOINT, target.name]
+    factory_ref = target_factory_ref or _infer_factory_ref(target)
 
     def _evaluate_isolated(program_path: str) -> dict:
-        # Correctness is judged against the candidate's OUTPUTS, computed in a
-        # subprocess the oracle is not reachable from.
-        with IsolatedCandidate(program_path, entrypoints, timeout=timeout) as iso:
-            if iso.load_error is not None:
-                return _zero(iso.load_error)
-            verdict = layered_oracle(target, None, output_fn=iso.output_fn)
-        if not verdict.accepted:
-            return _zero(verdict.reason)
-        # Correctness passed in isolation. Measure speedup with an in-process load
-        # (safe now: a wrong candidate already got 0.0; this only times a proven one).
-        try:
-            cand = _load_candidate(program_path, target)
-        except Exception as e:
-            return _zero(f"load failed: {type(e).__name__}")
-        if not callable(cand):
-            return _zero("no entrypoint")
-        sp = speedup(target.reference, cand, target.canonical_args + target.withheld_args)
-        sp = 0.0 if math.isinf(sp) else sp
-        return {"combined_score": sp, "correct": 1.0, "speedup": sp, "reason": verdict.reason}
+        if factory_ref is None:
+            return _zero(
+                "isolation requires target_factory_ref=('module','factory') for this target"
+            )
+        v = evaluate_isolated(program_path, factory_ref, entrypoints, timeout=timeout)
+        if not v.accepted:
+            return _zero(v.reason)
+        sp = 0.0 if (math.isinf(v.speedup) or math.isnan(v.speedup)) else v.speedup
+        return {"combined_score": sp, "correct": 1.0, "speedup": sp, "reason": v.reason}
 
     def _evaluate_inprocess(program_path: str) -> dict:
         try:
@@ -130,6 +128,27 @@ def make_openevolve_evaluator(
         return {"combined_score": sp, "correct": 1.0, "speedup": sp, "reason": verdict.reason}
 
     evaluate = _evaluate_isolated if isolate else _evaluate_inprocess
-    # Expose under both names (see docstring).
     evaluate.evaluator = evaluate  # type: ignore[attr-defined]
     return evaluate
+
+
+def _infer_factory_ref(target: Target) -> tuple[str, str] | None:
+    """Best-effort: a target named 'foo' usually lives at tripwire.targets.foo with a
+    `make_target` factory. Returns ('tripwire.targets.<base>', 'make_target') if that
+    module imports and its make_target() reproduces a Target of the same name, else
+    None (caller must then pass target_factory_ref explicitly)."""
+    base = target.name.split(":")[0]  # e.g. 'numeric:dot' -> 'numeric'
+    mod_name = f"tripwire.targets.{base}"
+    try:
+        mod = importlib.import_module(mod_name)
+    except Exception:
+        return None
+    factory = getattr(mod, "make_target", None)
+    if factory is None:
+        return None
+    try:
+        if factory().name == target.name:
+            return (mod_name, "make_target")
+    except Exception:
+        return None
+    return None

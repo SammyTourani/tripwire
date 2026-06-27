@@ -101,7 +101,14 @@ def naive_oracle(t: Target, cand: Callable, mode: str) -> Verdict:
     return Verdict(True, "passed canonical", speedup(t.reference, cand, t.canonical_args))
 
 
-def layered_oracle(t: Target, cand: Callable, *, output_fn: Callable | None = None) -> Verdict:
+def layered_oracle(
+    t: Target,
+    cand: Callable,
+    *,
+    _exact_equal: Callable = exact_equal,
+    _close_equal: Callable = close_equal,
+    _speedup: Callable = speedup,
+) -> Verdict:
     """The product. Exact-where-sound -> metamorphic -> differential on WITHHELD
     adversarial inputs -> isolated speedup. Assumes the candidate is trying to cheat.
 
@@ -111,19 +118,19 @@ def layered_oracle(t: Target, cand: Callable, *, output_fn: Callable | None = No
     Inputs are deep-copied per call so an input-mutating candidate cannot corrupt
     the reference or later candidates (H1).
 
-    `output_fn`, if given, is `output_fn(args_tuple) -> output` and is used INSTEAD
-    of calling `cand(*args)` directly. The hardened evaluator (Interface B) passes an
-    output_fn that runs the candidate in an ISOLATED SUBPROCESS, so the candidate can
-    never reach or monkeypatch this oracle (audit finding C1). It must raise to signal
-    a candidate failure (the oracle treats that as a rejection, like a live raise).
-    When None, the candidate is called in-process (the original trusted path)."""
-    cmp = exact_equal if t.kind == "structural" else close_equal
-    call = output_fn if output_fn is not None else (lambda args: cand(*_fresh_args(args)))
+    UNTRUSTED CODE runs via the hardened evaluator (Interface B), which executes this
+    ENTIRE function inside the candidate's own 'spawn' subprocess and returns only
+    primitives to the parent -- the candidate never executes in the evaluator's
+    process. TAMPER-RESISTANCE: the comparators and speedup are bound as DEFAULT
+    ARGUMENTS at function-definition time, captured as the original function objects,
+    so a candidate that monkeypatches `tripwire.oracle.close_equal` /
+    `tripwire.measure.*` in that child cannot defeat the verdict (audit finding C1)."""
+    cmp = _exact_equal if t.kind == "structural" else _close_equal
     # L1 -- canonical correctness
     for args in t.canonical_args:
         try:
             expected = t.reference(*_fresh_args(args))
-            got = call(args)
+            got = cand(*_fresh_args(args))
             if not cmp(expected, got):
                 return Verdict(False, "L1 canonical mismatch")
         except Exception as e:
@@ -132,7 +139,7 @@ def layered_oracle(t: Target, cand: Callable, *, output_fn: Callable | None = No
     for pname, pfn in t.properties:
         for args in t.canonical_args + t.withheld_args:
             try:
-                if not pfn(args, call(args)):
+                if not pfn(args, cand(*_fresh_args(args))):
                     return Verdict(False, f"L2 property '{pname}' violated")
             except Exception as e:
                 return Verdict(False, f"L2 raised {type(e).__name__}")
@@ -142,12 +149,12 @@ def layered_oracle(t: Target, cand: Callable, *, output_fn: Callable | None = No
     for args in t.withheld_args + _generative_withheld(t):
         try:
             expected = t.reference(*_fresh_args(args))
-            got = call(args)
+            got = cand(*_fresh_args(args))
             if not cmp(expected, got):
                 return Verdict(False, "L3 withheld-input differential mismatch")
         except Exception as e:
             return Verdict(False, f"L3 raised {type(e).__name__}")
-    # L4 -- isolated speedup across many shapes
-    return Verdict(
-        True, "passed all layers", speedup(t.reference, cand, t.canonical_args + t.withheld_args)
-    )
+    # L4 -- isolated speedup across many shapes (args copied so a mutating candidate
+    # cannot corrupt the shared Target during timing -- H1 at L4).
+    timing_args = [_fresh_args(a) for a in t.canonical_args + t.withheld_args]
+    return Verdict(True, "passed all layers", _speedup(t.reference, cand, timing_args))

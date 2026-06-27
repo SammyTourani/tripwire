@@ -1,67 +1,94 @@
-"""tripwire.isolation -- run untrusted candidate code in a FRESH subprocess.
+"""tripwire.isolation -- evaluate untrusted candidate code in a FRESH subprocess,
+returning ONLY primitive, trusted values across the process boundary.
 
-Audit findings C1 (in-process oracle tampering) and H1 (cross-candidate input
-mutation) both stem from one root cause: the evaluator imported and CALLED the
-candidate in the SAME interpreter as the oracle. A candidate's module-level code
-could then monkeypatch `tripwire.oracle`'s comparison functions (`exact_equal` /
-`close_equal` / `speedup`) and make a blatantly-wrong implementation score
-`correct=1.0, combined_score=huge` -- the verbatim Sakana "marked its own
-homework" exploit this whole project exists to prevent.
+Why this exists (audit history)
+--------------------------------
+The original evaluator imported and CALLED the candidate in the SAME interpreter as
+the oracle, so a candidate could monkeypatch the oracle's comparators and "mark its
+own homework" (the Sakana exploit). The first hardening attempt ran the candidate in
+a subprocess but shipped the candidate's OUTPUT objects back to the parent over an
+mp.Pipe -- which made the PARENT unpickle attacker-controlled data, an arbitrary
+code-execution hole (a malicious `__reduce__` runs in the trusted parent). It also
+still imported the candidate in-parent to time it.
 
-The fix: execute the candidate in a CHILD PROCESS started with the 'spawn' method
-(a brand-new interpreter, so it inherits none of the parent's already-imported,
-potentially-monkeypatched modules). The child loads the candidate ONCE, then serves
-the parent's input batches: for each arg-tuple it CALLS the candidate and returns
-the OUTPUT. All correctness comparison happens back in the clean PARENT process,
-against a reference the candidate's code never touched. Therefore:
-  * a candidate cannot reach (let alone patch) the oracle that judges it,
-  * a candidate that mutates its inputs only mutates throwaway copies in the child,
-  * a candidate that hangs is killed by a per-call timeout,
-  * a candidate that crashes/segfaults takes down only the child; the parent records
-    a failure (-> the oracle rejects it, score 0.0).
+The sound design (this module)
+-------------------------------
+The CHILD process does the ENTIRE evaluation and returns only THREE PRIMITIVES:
+`(accepted: bool, reason: str, speedup: float)`. The parent unpickles nothing the
+candidate controls -- only those primitives -- so there is no deserialization RCE,
+and the candidate never executes in the parent at all.
 
-`IsolatedCandidate` is a context manager exposing an `output_fn(args) -> output`
-that `layered_oracle(..., output_fn=...)` calls in place of the in-process
-candidate. Each call round-trips one input to the persistent child and back.
+Inside the child, the trusted machinery is captured into LOCAL variables BEFORE the
+candidate module is imported, so the candidate's module-level code cannot monkeypatch
+what the child uses to judge it:
+  * the reference function and comparators are imported and bound to locals first,
+  * then the candidate is loaded,
+  * then the oracle logic runs using those captured locals.
+A candidate that patches `tripwire.oracle.close_equal` in the child patches a name
+the child's evaluation no longer reads; and the child is a throwaway interpreter
+discarded immediately after, so any damage is contained.
 
-This module is imported only by tripwire/evaluator.py (Interface B). The pure,
-in-process oracle (tripwire/oracle.py) is unchanged and still usable directly for
-trusted candidates and tests; isolation is the hardened path for untrusted code.
+Crashes / hangs / fork-bombs take down only the child; the parent observes EOF or a
+timeout and reports a clean failure (-> rejected, score 0.0).
+
+Used only by tripwire/evaluator.py (Interface B). The in-process oracle
+(tripwire/oracle.py) is unchanged and still used directly for trusted code + tests.
 """
 from __future__ import annotations
 
 import multiprocessing as mp
+from dataclasses import dataclass
 
-# A fresh interpreter for the candidate. 'spawn' does NOT fork the parent's memory,
-# so the child cannot see (or undo) any parent-side state -- the oracle is unreachable.
+# Fresh interpreter per candidate. 'spawn' does not fork parent memory, so the child
+# starts from a clean import state the parent cannot have pre-poisoned.
 _CTX = mp.get_context("spawn")
 
-DEFAULT_TIMEOUT = 30.0  # seconds per candidate call; exceeding it = failure
+DEFAULT_TIMEOUT = 30.0  # seconds for the whole child evaluation; exceeding it = fail
+
+# Entrypoint names a candidate may expose (kept in sync with the evaluator).
+CANONICAL_ENTRYPOINT = "solve"
 
 
-class CandidateError(Exception):
-    """Raised in the PARENT by IsolatedCandidate.output_fn when the isolated child
-    fails on an input (load error, raise, crash, timeout). The oracle's per-layer
-    try/except turns this into a rejection -- exactly as if the candidate had raised
-    in-process. The message is a short reason ('timeout', 'raised ValueError', ...)."""
+@dataclass
+class IsolatedVerdict:
+    """The trusted, primitives-only result the parent receives from the child.
+    `speedup` is finite only when accepted; NaN/inf are normalized by the parent."""
+
+    accepted: bool
+    reason: str
+    speedup: float
 
 
-def _worker(program_path, entrypoint_names, conn):
-    """Runs IN THE CHILD. Loads the candidate once, then loops: receive an arg-tuple,
-    send back ('ok', output) or ('err', reason). The candidate may monkeypatch
-    anything in here -- it's a throwaway interpreter with no oracle in it."""
+def _child_evaluate(program_path, target_factory_ref, entrypoint_names, conn):
+    """Runs IN THE CHILD. Performs the FULL layered-oracle evaluation and sends back
+    only (accepted, reason, speedup) as primitives. See module docstring for why the
+    trusted functions are captured into locals before the candidate is imported.
+
+    `target_factory_ref` is a ('module', 'attr') pair naming a zero-arg factory that
+    rebuilds the Target fresh in this process (Targets contain callables/closures and
+    are reconstructed here rather than pickled across)."""
     try:
+        import importlib
+
+        # --- capture TRUSTED machinery into locals BEFORE loading the candidate ---
+        oracle_mod = importlib.import_module("tripwire.oracle")
+        layered = oracle_mod.layered_oracle  # uses measure.* bound at its import time
+
+        mod_name, attr = target_factory_ref
+        target = getattr(importlib.import_module(mod_name), attr)()
+
+        # --- now load the (untrusted) candidate ---
         import importlib.util
 
         spec = importlib.util.spec_from_file_location("candidate", program_path)
         if spec is None or spec.loader is None:
-            conn.send(("fatal", "load failed: no spec"))
+            conn.send((False, "load failed: no spec", 0.0))
             return
         mod = importlib.util.module_from_spec(spec)
         try:
             spec.loader.exec_module(mod)
         except Exception as e:
-            conn.send(("fatal", f"load failed: {type(e).__name__}"))
+            conn.send((False, f"load failed: {type(e).__name__}", 0.0))
             return
 
         fn = None
@@ -70,112 +97,81 @@ def _worker(program_path, entrypoint_names, conn):
             if fn is not None:
                 break
         if fn is None:
-            conn.send(("fatal", "no entrypoint"))
+            conn.send((False, "no entrypoint", 0.0))
             return
         if not callable(fn):
-            conn.send(("fatal", "entrypoint not callable"))
+            conn.send((False, "entrypoint not callable", 0.0))
             return
 
-        conn.send(("ready", None))
-        while True:
-            msg = conn.recv()
-            if msg == "__stop__":
-                return
-            args = msg
-            try:
-                conn.send(("ok", fn(*args)))
-            except Exception as e:
-                conn.send(("err", f"raised {type(e).__name__}"))
-    except Exception as e:  # last-resort; never hang the parent
+        # --- full oracle evaluation in the child; only primitives leave ---
+        verdict = layered(target, fn)
+        sp = float(verdict.speedup)
+        # normalize non-finite to a safe primitive (parent re-checks anyway)
+        if sp != sp or sp in (float("inf"), float("-inf")):
+            sp = float("inf") if sp == float("inf") else (0.0 if sp != sp else sp)
+        conn.send((bool(verdict.accepted), str(verdict.reason), sp))
+    except Exception as e:  # last-resort: never hang the parent
         try:
-            conn.send(("fatal", f"child error: {type(e).__name__}"))
+            conn.send((False, f"child error: {type(e).__name__}", 0.0))
         except Exception:
             pass
     finally:
         conn.close()
 
 
-class IsolatedCandidate:
-    """Context manager that loads `program_path` in a fresh subprocess and exposes
-    `output_fn(args) -> output`. Pass `.output_fn` to `layered_oracle(..., output_fn=)`.
+def evaluate_isolated(
+    program_path: str,
+    target_factory_ref: tuple[str, str],
+    entrypoint_names=None,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> IsolatedVerdict:
+    """Evaluate `program_path` against the Target produced by `target_factory_ref`
+    (a ('module','factory_attr') pair) entirely inside a fresh subprocess. Returns an
+    IsolatedVerdict built from PRIMITIVES only. Never raises; all failure modes
+    (load error, crash, segfault, fork-bomb death, timeout) map to accepted=False."""
+    if entrypoint_names is None:
+        entrypoint_names = [CANONICAL_ENTRYPOINT]
+    parent_conn, child_conn = _CTX.Pipe(duplex=False)
+    proc = _CTX.Process(
+        target=_child_evaluate,
+        args=(program_path, tuple(target_factory_ref), list(entrypoint_names), child_conn),
+        daemon=True,
+    )
+    proc.start()
+    child_conn.close()  # parent only reads
 
-    On enter: starts the child and waits for it to load the candidate. If loading
-    fails (no entrypoint, syntax error), `load_error` is set and `output_fn` will
-    raise CandidateError on first use (the oracle then rejects -> score 0.0).
-    """
-
-    def __init__(self, program_path, entrypoint_names, timeout=DEFAULT_TIMEOUT):
-        self.program_path = program_path
-        self.entrypoint_names = list(entrypoint_names)
-        self.timeout = timeout
-        self._proc = None
-        self._conn = None
-        self.load_error: str | None = None
-        self._dead = False
-
-    def __enter__(self):
-        parent_conn, child_conn = _CTX.Pipe(duplex=True)
-        self._conn = parent_conn
-        self._proc = _CTX.Process(
-            target=_worker,
-            args=(self.program_path, self.entrypoint_names, child_conn),
-            daemon=True,
-        )
-        self._proc.start()
-        child_conn.close()
-        # Wait for the child to finish loading the candidate's module.
-        if parent_conn.poll(self.timeout):
-            try:
-                tag, info = parent_conn.recv()
-            except EOFError:
-                self.load_error, self._dead = "crashed", True
-                return self
-            if tag == "ready":
-                pass
-            else:  # 'fatal' (load failed / no entrypoint / not callable)
-                self.load_error, self._dead = info, True
-        else:
-            self.load_error, self._dead = "load timeout", True
-        return self
-
-    def output_fn(self, args):
-        """Send one arg-tuple to the isolated child, return its output. Raises
-        CandidateError on any failure (load error, raise, crash, timeout)."""
-        if self.load_error is not None:
-            raise CandidateError(self.load_error)
-        if self._dead or self._conn is None:
-            raise CandidateError("crashed")
+    result = None
+    if parent_conn.poll(timeout):
         try:
-            self._conn.send(tuple(args))
-        except Exception:
-            self._dead = True
-            raise CandidateError("crashed") from None
-        if not self._conn.poll(self.timeout):
-            self._dead = True
-            raise CandidateError("timeout")
-        try:
-            tag, payload = self._conn.recv()
+            payload = parent_conn.recv()
         except EOFError:
-            self._dead = True
-            raise CandidateError("crashed") from None
-        if tag == "ok":
-            return payload
-        self._dead = tag == "fatal"  # err is per-call; fatal kills the worker
-        raise CandidateError(payload if isinstance(payload, str) else "raised")
+            payload = None  # child died without sending (segfault / killed)
+        # Defensively validate the shape/types -- the child is trusted code, but be
+        # strict so a corrupted message can never become a nonzero score.
+        if (
+            isinstance(payload, tuple)
+            and len(payload) == 3
+            and isinstance(payload[0], bool)
+            and isinstance(payload[1], str)
+            and isinstance(payload[2], (int, float))
+        ):
+            result = payload
+    else:
+        result = ("__timeout__",)  # sentinel
 
-    def __exit__(self, *exc):
-        try:
-            if self._conn is not None and not self._dead:
-                try:
-                    self._conn.send("__stop__")
-                except Exception:
-                    pass
-            if self._conn is not None:
-                self._conn.close()
-        finally:
-            if self._proc is not None:
-                self._proc.join(timeout=1.0)
-                if self._proc.is_alive():
-                    self._proc.terminate()
-                    self._proc.join(timeout=1.0)
-        return False
+    parent_conn.close()
+    proc.join(timeout=1.0)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=1.0)
+
+    if result is None:
+        return IsolatedVerdict(False, "crashed", 0.0)
+    if result == ("__timeout__",):
+        return IsolatedVerdict(False, "timeout", 0.0)
+
+    accepted, reason, sp = result
+    sp = float(sp)
+    if not accepted:
+        sp = 0.0
+    return IsolatedVerdict(accepted=accepted, reason=reason, speedup=sp)
