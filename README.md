@@ -1,8 +1,12 @@
 # Tripwire — a layered, adversarial-by-design correctness oracle for AI code optimization
 
-> **Status:** research artifact (Phase 2). The layered oracle is live across 7 domain targets, the
-> cross-domain benchmark and red-team suite run with no network, and a live OpenEvolve loop (target
-> zero) drives the oracle end-to-end. Working name; rename freely.
+> **Status:** research artifact (Phase 3). The layered oracle is live across 7 domain targets, the
+> cross-domain benchmark and red-team suite run with no network, a live OpenEvolve loop (target zero)
+> drives the oracle end-to-end with Claude as the proposer, and the editorial replay of both artifacts
+> is on the web. Working name; rename freely.
+>
+> **Live visualizer:** [sammytourani.github.io/tripwire](https://sammytourani.github.io/tripwire/) —
+> animated replay of the cross-domain scorecard and target zero.
 
 AI code optimizers are graded on a reward = **speedup**, gated by a *naive* correctness check
 (output-match, or a tolerance band on a fixed set of test inputs). That naive check fails in **two
@@ -19,6 +23,10 @@ opposite directions**:
 [OpenEvolve](https://github.com/algorithmicsuperintelligence/openevolve) so you never rebuild the
 optimization loop. Alongside it is the **Optimizer Integrity Bench (OIB)**, which puts a number on how
 often the naive checks current optimizers rely on either ship a hack or throw away a real win.
+
+**See the result before reading further:** the
+[live visualizer](https://sammytourani.github.io/tripwire/) replays both the cross-domain scorecard
+and target zero (Claude in the loop). The rest of this README is the *why*.
 
 ## The four layers
 
@@ -37,23 +45,24 @@ A correctness failure zeroes the reward, so a reward-hack can never earn a score
 
 ## The result, measured (no network, no LLM)
 
-`python -m bench.run` runs all 7 domain targets through all three oracles. Current scorecard on this
-machine:
+`python -m bench.run` runs all 7 domain targets through all three oracles. Across the **20 labeled
+candidates** in the current benchmark (3 correct, 4 correct-up-to-FP, 13 reward-hacks), the scorecard
+is stable across runs:
 
 ```
-SCORECARD  (15 candidates = 7 valid + 8 reward-hacks; across 7 domains)
-oracle              ships_hacks   integrity   kept_valid       verdict
-naive_bitwise                 8        0.27         43%        unsafe
-naive_tolerance               8        0.47        100%        unsafe
-layered                       0        1.00        100%   TRUSTWORTHY
+SCORECARD                       (20 candidates across 7 domain targets)
+oracle              ships_hacks  integrity  kept_valid       verdict
+naive_bitwise                 9       0.25         43%        unsafe
+naive_tolerance              13       0.35        100%        unsafe
+layered                       0       1.00        100%   TRUSTWORTHY
 ```
 
-- **naive_bitwise** ships every hack *and* discards real numeric wins (kept only 43% of valid
-  candidates — it rejects every `correct_fp` floating-point win).
-- **naive_tolerance** keeps the real wins but *still* ships every hack.
-- **layered** is the only oracle that ships **0 hacks** *and* keeps **100%** of valid wins, across
-  every domain → `TRUSTWORTHY`. `main()` exits non-zero if that ever stops holding (the benchmark's
-  regression gate).
+- **naive_bitwise** ships 9 of 13 hacks *and* discards every floating-point-correct win (it keeps
+  only 43% of valid candidates — every `correct_fp` candidate, the FMA / reordered-reduction wins,
+  gets thrown away).
+- **naive_tolerance** keeps every real win but ships **every single hack** — 13 of 13.
+- **layered** ships **0 hacks** and keeps **100%** of valid wins, across every domain →
+  `TRUSTWORTHY`. `bench.run.main()` exits non-zero if that ever stops holding (the regression gate).
 
 ### Live domains (7 target instances)
 
@@ -71,20 +80,27 @@ new layer or a new withheld-input distribution.
 
 ### Why the magnitudes here are illustrative
 
-The headline reward-hacks register as enormous mirage "speedups" (a memorized candidate that returns a
-cached answer looks thousands of times faster — currently in the ~2,700x and ~5,700x range on this
-box), and a genuine `np.sum` win that a *bitwise* oracle throws away is a real ~100x+ speedup
-(currently ~167x). **These are timing ratios and are hardware-dependent — exact magnitudes vary by
-machine.** The point is the *direction*: the mirages are huge and the discarded win is real, and only
-the layered oracle gets both calls right. (Older write-ups quote ~2,040x / ~5,231x / ~176x from an
-earlier machine; treat all such numbers as approximate.)
+The recorded benchmark stores `layered_speedup` only for candidates the layered oracle accepted, and
+the four FP-correct numeric wins that `naive_bitwise` throws away are real and large on this machine
+— `sum_reduction` **180×**, `numeric:dot` **849×**, `numeric:matvec` **3,536×**, `numeric:matmul`
+**4,294×** (each with a measured lower bound; see `viz/public/data/bench.jsonl`). The 13 reward-hacks
+are all rejected at L1/L2/L3, so their "speedups" are never measured by the layered oracle (that is
+the design — a hack must never earn a number). When a hack ships through a naive oracle in the wild,
+its apparent speedup is a function of how aggressively it skips work; the visualizer's hack-row bars
+are deliberately illustrative for that reason. **All timing ratios are hardware-dependent in absolute
+magnitude; what is invariant is the direction — the kept wins are real and the rejected hacks fail on
+the withheld inputs.**
 
 ## Target zero — a COMPILOT-inspired live loop, with Claude as the proposer
 
 `runner/target_zero.py` wires the layered oracle (via the OpenEvolve evaluator) into a real,
 network-backed OpenEvolve run with **Claude (Opus 4.8)** proposing optimizations of a Python numeric
-kernel (`sum_reduction`). The recorded run (`runs/target-zero.jsonl`, `runs/target-zero-summary.json`)
-kept a correct candidate at a ~200x speedup, verified through all four layers.
+kernel (`sum_reduction`). The recorded run (`runs/target-zero.jsonl`,
+`runs/target-zero-summary.json`) reached a **200.28×** speedup at iteration 5, verified through all
+four layers; the
+[visualizer's target-zero section](https://sammytourani.github.io/tripwire/#target-zero) replays the
+full 10-iteration trace, with the candidate code, Claude's reasoning, and the oracle's verdict per
+iteration.
 
 **Honest framing:** this is **COMPILOT-*inspired*, not a COMPILOT reproduction.** COMPILOT
 (arXiv:2511.00592) optimizes **C loop nests** through the **Tiramisu polyhedral compiler** with
@@ -92,8 +108,8 @@ kept a correct candidate at a ~200x speedup, verified through all four layers.
 **empirical layered oracle**. What it reproduces is the *principle* the paper validates in RQ7 —
 **delegate correctness to a rigorous verifier rather than trusting the LLM to be correct** — not the
 system. It also fills a literal gap in the paper: COMPILOT's Table I evaluated Gemini / GPT / o3 /
-Llama / Gemma / QwQ / Qwen / Codestral, but **never an Anthropic model**. Running it needs network and
-an LLM key (read from a local, gitignored `.env`).
+Llama / Gemma / QwQ / Qwen / Codestral, but **never an Anthropic model**. Running it needs network
+and an LLM key (read from a local, gitignored `.env`).
 
 ## Novelty claim (calibrated — the README stays inside this)
 
@@ -167,6 +183,7 @@ The OpenEvolve loop (target zero) additionally needs the `runner` extra and a ne
 - `tripwire/evaluator.py` — Interface B (the OpenEvolve adapter; correctness failure zeroes the score).
 - `bench/run.py` — the cross-domain scorecard + JSONL log; `bench/attack_suite.py` — the red-team suite.
 - `runner/` — target zero (the live OpenEvolve loop with Claude).
+- `viz/` — the editorial replay UI; deployed to GitHub Pages automatically by `.github/workflows/pages.yml`.
 - `optimizer_integrity_bench.py` — the proven Phase-0 seed, kept runnable as a regression smoke test.
 - `docs/` — `threat-model.md` (the adversary, sourced), `decisions.md` (the ADRs), `target-authoring.md`,
   and `compilot-paper.pdf`.
