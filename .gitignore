@@ -12,5 +12,10 @@ venv/
 # Benchmark / run artifacts (regenerated; not source of truth)
 runs/
 
+# The COMPILOT paper (arXiv:2511.00592) -- kept LOCAL only. It carries an IEEE
+# copyright notice; arXiv v2 is freely available, so it is not redistributed via
+# this repo. Add it locally per docs/ADD_THE_PAPER.md as docs/compilot-paper.pdf.
+docs/compilot-paper.pdf
+
 # OS
 .DS_Store
