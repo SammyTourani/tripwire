@@ -12,10 +12,10 @@ kind OpenEvolve / Sakana-style optimizers actually use -- either:
       test inputs -- i.e. reward hacking (the documented Sakana failure).
 
 Thesis this seeds:
-  The agentic optimization loop is commoditized (OpenEvolve). The un-cheatable
-  oracle is the product. This file proves -- no network, no LLM -- that NEITHER a
-  bitwise oracle NOR a tolerance oracle is simultaneously safe and
-  speedup-preserving. Only a layered oracle with WITHHELD, adversarial
+  The agentic optimization loop is commoditized (OpenEvolve). The layered,
+  adversarial-by-design oracle is the product. This file proves -- no network, no
+  LLM -- that NEITHER a bitwise oracle NOR a tolerance oracle is simultaneously
+  safe and speedup-preserving. Only a layered oracle with WITHHELD, adversarial
   differential inputs is. Then it exposes that oracle as an OpenEvolve evaluator.
 
 Run:  python optimizer_integrity_bench.py

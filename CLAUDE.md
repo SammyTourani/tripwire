@@ -24,7 +24,7 @@ live docs. Your training cutoff predates the versions this repo runs on (see ADR
 
 The agentic code-optimization loop is **commoditized** — OpenEvolve (6k+ stars) already gives you
 the LLM-proposes → evaluate → keep-best → iterate loop, production-grade, off the shelf. The thing
-nobody has built is the part that makes that loop *trustworthy*: an **un-cheatable, layered
+nobody has built is the part that makes that loop *trustworthy*: a **layered, adversarial-by-design
 correctness oracle**. We are building (a) that oracle, shipped as a drop-in OpenEvolve evaluator, and
 (b) a public benchmark that measures how often current AI optimizers ship reward-hacked or
 silently-wrong "optimizations."

@@ -1,7 +1,7 @@
 """Security / isolation regression tests (hardening pass).
 
-These lock in fixes for audit findings that defeated the oracle's "un-cheatable"
-claim. If a future change re-opens any, these fail.
+These lock in fixes for audit findings on the candidate-execution sandbox. If a
+future change re-opens any, these fail.
 
   C1   -- in-process oracle tampering ("marked its own homework"). Killed by running
           the FULL evaluation in a subprocess that returns only primitives.
@@ -333,3 +333,133 @@ def test_H1_L4_timing_path_does_not_corrupt_shared_args():
     # The shared canonical args must be unchanged.
     for snap, args in zip(canonical_snapshot, t.canonical_args, strict=True):
         assert np.array_equal(snap, args[0]), "L4 timing leaked raw args to a mutating candidate"
+
+
+# ---------------------------------------------------------------------------
+# ROUND-4 STRUCTURAL GUARANTEES (fresh-subprocess design).
+# These lock in the architectural properties that make the previous attack
+# classes IMPOSSIBLE rather than merely patched:
+#   * the candidate runs in a fresh-exec'd interpreter (no inherited Python heap),
+#   * the parent owns the clock (candidate cannot forge its timing),
+#   * `gc.get_objects()` in the child finds NO parent-reachable IPC handle.
+# ---------------------------------------------------------------------------
+def test_R4_candidate_heap_contains_no_parent_ipc_handle(tmp_path):
+    """In the round-4 architecture, a fresh `subprocess.run([python, '-I', shim])`
+    child has no `multiprocessing.Connection` or parent-reachable socket in its
+    Python heap. This is what makes the round-1/round-2 pipe-smuggle attack class
+    STRUCTURALLY IMPOSSIBLE: there is no handle for `gc.get_objects()` to find."""
+    recon = _write(
+        tmp_path,
+        "recon.py",
+        """
+        import gc, socket
+        import multiprocessing.connection as mpc
+        _conns = [o for o in gc.get_objects() if isinstance(o, mpc.Connection)]
+        _socks = [o for o in gc.get_objects() if isinstance(o, socket.socket)]
+        def solve(arr):
+            return {"connections": len(_conns), "sockets": len(_socks)}
+        """,
+    )
+    with IsolatedCandidate(recon, ["solve"]) as iso:
+        out = iso.output_fn((np.array([1.0]),))
+        assert out["connections"] == 0, "ROUND-4 BREACH: Connection visible in candidate heap"
+        assert out["sockets"] == 0, "ROUND-4 BREACH: socket visible in candidate heap"
+
+
+def test_R4_timing_forge_is_blocked_parent_owns_clock(tmp_path):
+    """Round-3's critical: the candidate could pre-send a forged tiny `elapsed` over
+    a shared socket, scoring billions of x faster than reality. Round 4 has the
+    parent measure wall time around each call; the candidate never reports a clock,
+    so it cannot forge one. A genuinely-slower candidate scores LESS than ref, not
+    arbitrarily more."""
+    slow = _write(
+        tmp_path,
+        "slow.py",
+        """
+        import time, numpy as np
+        def solve(arr):
+            # Genuinely slower than the np.sum reference, AND patches the local
+            # time module -- which is now harmless because the parent owns timing.
+            time.perf_counter = lambda: 0.0
+            time.sleep(0.001)
+            return float(np.asarray(arr, dtype=np.float64).sum())
+        """,
+    )
+    result = make_openevolve_evaluator(make_target())(slow)
+    assert result["correct"] == 1.0, result["reason"]
+    # Genuinely-slower candidate must NOT score arbitrarily high. Compared to the
+    # in-process reference timing, a sleep-injecting candidate will score < ~100x
+    # (the honest np.sum win is ~180x; this is bounded well below that).
+    assert result["combined_score"] < 50.0, (
+        f"TIMING FORGE: slower candidate scored {result['combined_score']}x"
+    )
+
+
+def test_R4_child_runs_with_empty_env(tmp_path):
+    """The shim is launched with `env={}`, so the candidate can't read parent
+    env vars (e.g. API keys in OPENAI_API_KEY)."""
+    leak = _write(
+        tmp_path,
+        "leak.py",
+        """
+        import os
+        def solve(arr):
+            return sorted(os.environ.keys())
+        """,
+    )
+    with IsolatedCandidate(leak, ["solve"]) as iso:
+        env_keys = iso.output_fn((1,))
+        # Some baseline OS-injected vars may exist (PATH etc. on some platforms);
+        # what matters is OPENAI_API_KEY / OPENAI_BASE_URL / OPENEVOLVE_MODEL etc.
+        for sensitive in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENEVOLVE_MODEL"):
+            assert sensitive not in env_keys, f"env leakage: {sensitive} reached candidate"
+
+
+def test_R4_python_isolated_mode_blocks_user_site(tmp_path):
+    """`python -I` disables user site-packages and ignores PYTHON* env vars, so a
+    candidate cannot pre-load malicious code into its own interpreter via the
+    parent's environment."""
+    probe = _write(
+        tmp_path,
+        "probe.py",
+        """
+        import sys
+        def solve(arr):
+            return {
+                "flags_isolated": int(sys.flags.isolated),
+                "no_user_site": int(sys.flags.no_user_site),
+                "no_site": int(sys.flags.no_site),
+                "ignore_environment": int(sys.flags.ignore_environment),
+            }
+        """,
+    )
+    with IsolatedCandidate(probe, ["solve"]) as iso:
+        flags = iso.output_fn((1,))
+        assert flags["flags_isolated"] == 1, "candidate not in -I isolated mode"
+        assert flags["ignore_environment"] == 1
+        assert flags["no_user_site"] == 1
+
+
+def test_R4_decode_rejects_object_dtype_array(tmp_path):
+    """Round-3 audit medium: a malicious dtype string could trigger huge per-element
+    allocations or unpickling inside numpy. The codec now whitelists dtypes (no
+    object dtype, capped itemsize). A candidate returning an object-dtype ndarray
+    is rejected, not unpickled."""
+    p = _write(
+        tmp_path,
+        "obj_dtype.py",
+        """
+        import numpy as np
+        def solve(arr):
+            return np.array([object()], dtype=object)
+        """,
+    )
+    with IsolatedCandidate(p, ["solve"]) as iso:
+        try:
+            iso.output_fn((1,))
+        except CandidateError as e:
+            # Either the shim rejected the encode (TypeError) or the parent decode
+            # refused the dtype. Either way: not unpickled, not silently accepted.
+            assert "unencodable" in str(e) or "dtype" in str(e) or "decode" in str(e), str(e)
+        else:
+            raise AssertionError("object-dtype output should have been rejected")

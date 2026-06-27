@@ -111,10 +111,18 @@ COMPILOT proved the *principle* — delegate correctness to something rigorous �
 
 This is a research artifact, not a finished product, and the claim is deliberately bounded:
 
-- Candidate code is executed by an evaluator. The oracle makes reward-hacking *hard* — it is
-  adversarial-by-design and survives the attacks in the suite — but "un-cheatable" is an aspiration,
-  not a proof of absolute invulnerability. The oracle is only as strong as the attacks it has
-  survived, which is why the red-team suite is a permanent, growing fixture.
+- **Tripwire is a correctness oracle, not a Python sandbox.** Its layered design is
+  adversarial-by-design against a gradient-following optimizer (the documented Sakana failure mode),
+  and the candidate-execution boundary has been hardened against in-process tampering, IPC-channel
+  RCE, verdict hijacking, and timing-forge (see `tests/test_isolation_security.py`). Pure-Python
+  in-process sandboxing of fully-adversarial code is a published negative result — see PEP 551 and
+  the pysandbox post-mortem — and Tripwire does not claim to have solved it. If you run Tripwire
+  against an LLM you do not trust to be benign at the OS level (file writes, network egress,
+  fork-bombs), deploy the evaluator under gVisor, Firecracker, or a hardened container, exactly as
+  you would for any other untrusted Python execution. The contract is on the *correctness axis*: a
+  wrong candidate cannot earn reward, regardless of what it does inside its sandbox process.
+- The oracle is only as strong as the attacks it has survived, which is why the red-team suite is a
+  permanent, growing fixture.
 - Numeric correctness rests on tolerance + metamorphic relations and a withheld differential, not on
   a formal proof; soundness depends on the target author choosing good properties and adversarial
   withheld inputs.

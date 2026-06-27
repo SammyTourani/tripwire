@@ -1,6 +1,6 @@
 # START HERE
 
-This is the build package for **Tripwire** — an un-cheatable, layered correctness oracle for AI
+This is the build package for **Tripwire** — a layered, adversarial-by-design correctness oracle for AI
 code optimization, shipped as a drop-in OpenEvolve evaluator, plus a benchmark that measures how
 often AI optimizers ship reward-hacked code. Follow these steps to start building with Claude Code.
 
