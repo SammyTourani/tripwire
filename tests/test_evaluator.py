@@ -7,14 +7,9 @@ evaluate(program_path).
 
 We also prove the contract shape (the four required keys), the happy path (a real
 win scores > 0 with correct == 1.0), and the failure modes that must NOT crash the
-evaluator (unloadable program, missing entrypoint).
-
-These tests use inline, ad-hoc Targets and TRUSTED candidate files, so they run the
-evaluator with `isolate=False` (the in-process path) to unit-test its LOGIC without
-needing a reconstructable factory for the subprocess. The hardened default
-(isolate=True) and its security guarantees -- incl. that a hack scores 0.0 through
-the isolated path -- are covered in tests/test_isolation_security.py against the
-real importable sum_reduction target.
+evaluator (unloadable program, missing entrypoint). These run through the DEFAULT
+isolated path (candidate in a sandbox subprocess, oracle in this process), so they
+also exercise the security boundary end-to-end.
 """
 from __future__ import annotations
 
@@ -65,7 +60,7 @@ def test_planted_hack_scores_zero_through_adapter(tmp_path):
     """A program that memorizes the canonical inputs (correct on what it was shown,
     wrong on withheld) MUST score combined_score == 0.0. This is the whole point."""
     target = _wordcount_target()
-    evaluate = make_openevolve_evaluator(target, isolate=False)
+    evaluate = make_openevolve_evaluator(target)
 
     # The hack: a dict memorizing ONLY the canonical inputs; empty for anything else.
     # Correct on canonical (passes a naive oracle), wrong on withheld (L3 catches it).
@@ -95,7 +90,7 @@ def test_constant_returning_instant_hack_scores_zero(tmp_path):
     """The Sakana-style mirage: a near-instant constant-returning candidate. Looks
     infinitely fast, is wrong everywhere. Must score 0.0 (HARD RULE 6)."""
     target = _wordcount_target()
-    evaluate = make_openevolve_evaluator(target, isolate=False)
+    evaluate = make_openevolve_evaluator(target)
 
     const_path = _write(
         tmp_path,
@@ -116,7 +111,7 @@ def test_constant_returning_instant_hack_scores_zero(tmp_path):
 # ---------------------------------------------------------------------------
 def test_correct_candidate_scores_positive(tmp_path):
     target = _wordcount_target()
-    evaluate = make_openevolve_evaluator(target, isolate=False)
+    evaluate = make_openevolve_evaluator(target)
 
     good_path = _write(
         tmp_path,
@@ -141,7 +136,7 @@ def test_correct_candidate_scores_positive(tmp_path):
 # ---------------------------------------------------------------------------
 def test_result_always_has_required_keys(tmp_path):
     target = _wordcount_target()
-    evaluate = make_openevolve_evaluator(target, isolate=False)
+    evaluate = make_openevolve_evaluator(target)
     good_path = _write(
         tmp_path,
         "g.py",
@@ -164,7 +159,7 @@ def test_result_always_has_required_keys(tmp_path):
 # ---------------------------------------------------------------------------
 def test_unloadable_program_scores_zero_without_crashing(tmp_path):
     target = _wordcount_target()
-    evaluate = make_openevolve_evaluator(target, isolate=False)
+    evaluate = make_openevolve_evaluator(target)
     broken = _write(
         tmp_path,
         "broken.py",
@@ -181,7 +176,7 @@ def test_unloadable_program_scores_zero_without_crashing(tmp_path):
 
 def test_missing_entrypoint_scores_zero(tmp_path):
     target = _wordcount_target()
-    evaluate = make_openevolve_evaluator(target, isolate=False)
+    evaluate = make_openevolve_evaluator(target)
     no_entry = _write(
         tmp_path,
         "noentry.py",
@@ -199,7 +194,7 @@ def test_target_name_entrypoint_fallback(tmp_path):
     """If there is no `solve`, the adapter falls back to a function named after the
     target (matches the proven seed adapter)."""
     target = _wordcount_target()  # name == "wordcount"
-    evaluate = make_openevolve_evaluator(target, isolate=False)
+    evaluate = make_openevolve_evaluator(target)
     named = _write(
         tmp_path,
         "named.py",
@@ -236,7 +231,7 @@ def test_numeric_reordered_sum_is_rewarded_not_rejected(tmp_path):
         [],
         {},
     )
-    evaluate = make_openevolve_evaluator(target, isolate=False)
+    evaluate = make_openevolve_evaluator(target)
     fast = _write(
         tmp_path,
         "fastsum.py",
@@ -256,7 +251,7 @@ def test_numeric_reordered_sum_is_rewarded_not_rejected(tmp_path):
 # ---------------------------------------------------------------------------
 def test_entrypoint_exposed_under_both_names():
     target = _wordcount_target()
-    evaluate = make_openevolve_evaluator(target, isolate=False)
+    evaluate = make_openevolve_evaluator(target)
     assert callable(evaluate)
     assert evaluate.evaluator is evaluate
 
@@ -278,7 +273,7 @@ def test_adapter_zeroes_what_naive_would_ship(tmp_path):
     # naive (canonical-only) would accept this hack...
     assert naive_oracle(target, hack, "bitwise").accepted
     # ...but the adapter (layered oracle) zeroes it.
-    evaluate = make_openevolve_evaluator(target, isolate=False)
+    evaluate = make_openevolve_evaluator(target)
     hack_path = _write(
         tmp_path,
         "h.py",

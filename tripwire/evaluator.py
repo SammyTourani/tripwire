@@ -33,7 +33,8 @@ import importlib.util
 import math
 from collections.abc import Callable
 
-from tripwire.isolation import DEFAULT_TIMEOUT, evaluate_isolated
+from tripwire.isolation import DEFAULT_TIMEOUT, CandidateError, IsolatedCandidate
+from tripwire.measure import measure_time
 from tripwire.oracle import layered_oracle
 from tripwire.target import Target
 
@@ -62,11 +63,7 @@ def _load_candidate(program_path: str, target: Target) -> Callable | None:
 
 
 def make_openevolve_evaluator(
-    target: Target,
-    *,
-    isolate: bool = True,
-    timeout: float = DEFAULT_TIMEOUT,
-    target_factory_ref: tuple[str, str] | None = None,
+    target: Target, *, isolate: bool = True, timeout: float = DEFAULT_TIMEOUT
 ) -> Callable[[str], dict]:
     """Build the OpenEvolve evaluator for `target`.
 
@@ -77,20 +74,17 @@ def make_openevolve_evaluator(
       speedup        : measured speedup (== combined_score on success), 0.0 otherwise.
       reason         : human-readable verdict / failing layer.
 
-    SECURITY (isolate=True, the default): the ENTIRE evaluation -- loading the
-    candidate, running the layered oracle, and measuring speedup -- happens in a
-    fresh 'spawn' subprocess. The subprocess returns ONLY primitives
-    (accepted, reason, speedup); the parent deserializes nothing the candidate
-    controls. Therefore the candidate never executes in the evaluator's process and
-    cannot (a) monkeypatch the oracle, (b) run code in the parent via a malicious
-    pickle `__reduce__`, or (c) corrupt inputs/state for later candidates. Inside the
-    child, the oracle's comparators/speedup are captured as default args before the
-    candidate loads, so even in-child monkeypatching cannot fake a verdict.
-
-    To run in the subprocess, the child must REBUILD the Target from a zero-arg
-    factory named by `target_factory_ref=('module', 'attr')`. If not provided, it is
-    inferred from `target` when possible (e.g. tripwire.targets.<name>.make_target);
-    pass it explicitly for custom targets.
+    SECURITY (isolate=True, the default): the candidate runs in a sandbox subprocess
+    (tripwire.isolation) that emits ONLY its raw outputs encoded as JSON. The layered
+    ORACLE -- comparators, properties, the Verdict type, everything that decides
+    correctness -- runs in THIS trusted parent, comparing the JSON-decoded candidate
+    outputs against the reference. The parent NEVER unpickles candidate data and never
+    imports/executes the candidate. Therefore a candidate cannot (a) monkeypatch the
+    oracle, (b) rebind the Verdict type to fake a verdict, (c) run code in the parent
+    via a malicious pickle, or (d) poison later candidates -- all of which defeated
+    earlier designs (audit C1 / pipe-RCE / Verdict-hijack). Speedup is measured INSIDE
+    the sandbox (candidate timing) vs an in-parent reference timing, so the candidate
+    still never runs here.
 
     isolate=False runs the candidate in-process (the original trusted path) -- use
     only for trusted code / tests, never for untrusted evolved programs.
@@ -99,18 +93,29 @@ def make_openevolve_evaluator(
     the `.evaluator` attribute (CLAUDE.md Interface B wording).
     """
     entrypoints = [CANONICAL_ENTRYPOINT, target.name]
-    factory_ref = target_factory_ref or _infer_factory_ref(target)
 
     def _evaluate_isolated(program_path: str) -> dict:
-        if factory_ref is None:
-            return _zero(
-                "isolation requires target_factory_ref=('module','factory') for this target"
-            )
-        v = evaluate_isolated(program_path, factory_ref, entrypoints, timeout=timeout)
-        if not v.accepted:
-            return _zero(v.reason)
-        sp = 0.0 if (math.isinf(v.speedup) or math.isnan(v.speedup)) else v.speedup
-        return {"combined_score": sp, "correct": 1.0, "speedup": sp, "reason": v.reason}
+        try:
+            with IsolatedCandidate(program_path, entrypoints, timeout=timeout) as iso:
+                if iso.load_error is not None:
+                    return _zero(iso.load_error)
+                # Correctness: the oracle runs HERE (parent); only the candidate's
+                # JSON-decoded outputs cross from the sandbox.
+                verdict = layered_oracle(target, output_fn=iso.output_fn)
+                if not verdict.accepted:
+                    return _zero(verdict.reason)
+                # Speedup: time the candidate inside the sandbox vs the reference here.
+                shapes = target.canonical_args + target.withheld_args
+                try:
+                    t_cand = iso.time_fn(shapes, repeats=5)
+                except CandidateError as e:
+                    return _zero(str(e))
+            t_ref = measure_time(target.reference, shapes, repeats=5)
+            sp = (t_ref / t_cand) if t_cand > 0 else float("inf")
+            sp = 0.0 if (math.isinf(sp) or math.isnan(sp)) else sp
+            return {"combined_score": sp, "correct": 1.0, "speedup": sp, "reason": verdict.reason}
+        except Exception as e:
+            return _zero(f"isolation error: {type(e).__name__}")
 
     def _evaluate_inprocess(program_path: str) -> dict:
         try:
@@ -130,25 +135,3 @@ def make_openevolve_evaluator(
     evaluate = _evaluate_isolated if isolate else _evaluate_inprocess
     evaluate.evaluator = evaluate  # type: ignore[attr-defined]
     return evaluate
-
-
-def _infer_factory_ref(target: Target) -> tuple[str, str] | None:
-    """Best-effort: a target named 'foo' usually lives at tripwire.targets.foo with a
-    `make_target` factory. Returns ('tripwire.targets.<base>', 'make_target') if that
-    module imports and its make_target() reproduces a Target of the same name, else
-    None (caller must then pass target_factory_ref explicitly)."""
-    base = target.name.split(":")[0]  # e.g. 'numeric:dot' -> 'numeric'
-    mod_name = f"tripwire.targets.{base}"
-    try:
-        mod = importlib.import_module(mod_name)
-    except Exception:
-        return None
-    factory = getattr(mod, "make_target", None)
-    if factory is None:
-        return None
-    try:
-        if factory().name == target.name:
-            return (mod_name, "make_target")
-    except Exception:
-        return None
-    return None

@@ -24,11 +24,9 @@ import textwrap
 import numpy as np
 
 from tripwire.evaluator import make_openevolve_evaluator
-from tripwire.isolation import evaluate_isolated
+from tripwire.isolation import CandidateError, IsolatedCandidate
 from tripwire.oracle import layered_oracle
 from tripwire.targets.sum_reduction import make_target
-
-_SUM_FACTORY = ("tripwire.targets.sum_reduction", "make_target")
 
 
 def _write(tmp_path, name, src):
@@ -171,20 +169,25 @@ def test_isolated_wrong_candidate_scores_zero(tmp_path):
 
 def test_isolation_missing_entrypoint(tmp_path):
     p = _write(tmp_path, "noentry.py", "x = 1\n")
-    v = evaluate_isolated(p, _SUM_FACTORY, ["solve", "sum_reduction"])
-    assert not v.accepted and v.reason == "no entrypoint"
+    with IsolatedCandidate(p, ["solve", "sum_reduction"]) as iso:
+        assert iso.load_error == "no entrypoint"
 
 
 def test_isolation_syntax_error(tmp_path):
     p = _write(tmp_path, "broken.py", "def solve(arr)\n    return 1\n")
-    v = evaluate_isolated(p, _SUM_FACTORY, ["solve"])
-    assert not v.accepted and "load failed" in v.reason
+    with IsolatedCandidate(p, ["solve"]) as iso:
+        assert iso.load_error is not None and "load failed" in iso.load_error
 
 
 def test_isolation_candidate_that_raises(tmp_path):
     p = _write(tmp_path, "raiser.py", "def solve(arr):\n    raise ValueError('boom')\n")
-    v = evaluate_isolated(p, _SUM_FACTORY, ["solve"])
-    assert not v.accepted  # raised at L1 -> rejected
+    with IsolatedCandidate(p, ["solve"]) as iso:
+        assert iso.load_error is None  # loads fine
+        try:
+            iso.output_fn((1,))
+            raise AssertionError("expected CandidateError")
+        except CandidateError as e:
+            assert "raised" in str(e)
 
 
 def test_isolation_timeout_on_hang(tmp_path):
@@ -197,22 +200,91 @@ def test_isolation_timeout_on_hang(tmp_path):
                 pass
         """,
     )
-    v = evaluate_isolated(p, _SUM_FACTORY, ["solve"], timeout=2.0)
-    assert not v.accepted and v.reason == "timeout"
+    with IsolatedCandidate(p, ["solve"], timeout=2.0) as iso:
+        try:
+            iso.output_fn((1,))
+            raise AssertionError("expected timeout")
+        except CandidateError as e:
+            assert "timeout" in str(e)
 
 
-def test_isolation_returns_only_primitive_speedup(tmp_path):
-    """The cross-process result's speedup is always a plain float (no candidate
-    object crosses the boundary)."""
+def test_isolation_output_is_json_decoded_not_unpickled(tmp_path):
+    """A correct candidate's output crosses as JSON and decodes to the right value;
+    no candidate object is ever unpickled by the parent."""
     good = _write(
         tmp_path,
         "g.py",
         "import numpy as np\ndef solve(arr):\n    return float(np.asarray(arr).sum())\n",
     )
-    v = evaluate_isolated(good, _SUM_FACTORY, ["solve", "sum_reduction"])
-    assert isinstance(v.speedup, float)
-    assert isinstance(v.accepted, bool)
-    assert isinstance(v.reason, str)
+    with IsolatedCandidate(good, ["solve", "sum_reduction"]) as iso:
+        out = iso.output_fn((np.array([1.0, 2.0, 3.0]),))
+        assert isinstance(out, float) and abs(out - 6.0) < 1e-9
+
+
+def test_isolation_unencodable_output_is_rejected(tmp_path):
+    """A candidate returning a non-JSON-encodable object is a failure, never a pass."""
+    p = _write(
+        tmp_path,
+        "weird.py",
+        "def solve(arr):\n    return object()\n",
+    )
+    with IsolatedCandidate(p, ["solve"]) as iso:
+        try:
+            iso.output_fn((1,))
+            raise AssertionError("expected CandidateError")
+        except CandidateError as e:
+            assert "unencodable" in str(e)
+
+
+def test_pipe_smuggling_cannot_execute_in_parent(tmp_path):
+    """A candidate that grabs the child's socket and sends a malicious PICKLE must NOT
+    run code in the parent -- the parent decodes with json.loads, never pickle."""
+    proof = tmp_path / "smuggle_proof.txt"
+    evil = _write(
+        tmp_path,
+        "smuggle.py",
+        f"""
+        import gc, os, socket, pickle
+        class Pwn:
+            def __reduce__(self):
+                return (os.system, ("touch {proof}",))
+        for obj in gc.get_objects():
+            try:
+                if isinstance(obj, socket.socket):
+                    obj.sendall(pickle.dumps(Pwn()))
+            except Exception:
+                pass
+        def solve(arr):
+            return 0.5
+        """,
+    )
+    result = make_openevolve_evaluator(make_target())(evil)
+    assert not proof.exists(), "PIPE-SMUGGLING RCE: candidate pickle executed in the parent"
+    assert result["combined_score"] == 0.0
+
+
+def test_verdict_class_hijack_is_blocked(tmp_path):
+    """A candidate rebinding tripwire.oracle.Verdict cannot fake a passing verdict,
+    because the oracle (and Verdict) run in the trusted parent, not the candidate's
+    process."""
+    evil = _write(
+        tmp_path,
+        "verdict_hijack.py",
+        """
+        import tripwire.oracle as O
+        class _AlwaysAccept:
+            def __init__(self, *a, **k):
+                self.accepted = True
+                self.reason = "x"
+                self.speedup = 424242.0
+        O.Verdict = _AlwaysAccept
+        def solve(arr):
+            return 0.5  # blatantly wrong
+        """,
+    )
+    result = make_openevolve_evaluator(make_target())(evil)
+    assert result["combined_score"] == 0.0, "VERDICT-HIJACK: wrong code earned reward"
+    assert result["correct"] == 0.0
 
 
 # ---------------------------------------------------------------------------

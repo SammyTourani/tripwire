@@ -103,8 +103,9 @@ def naive_oracle(t: Target, cand: Callable, mode: str) -> Verdict:
 
 def layered_oracle(
     t: Target,
-    cand: Callable,
+    cand: Callable | None = None,
     *,
+    output_fn: Callable | None = None,
     _exact_equal: Callable = exact_equal,
     _close_equal: Callable = close_equal,
     _speedup: Callable = speedup,
@@ -118,19 +119,26 @@ def layered_oracle(
     Inputs are deep-copied per call so an input-mutating candidate cannot corrupt
     the reference or later candidates (H1).
 
-    UNTRUSTED CODE runs via the hardened evaluator (Interface B), which executes this
-    ENTIRE function inside the candidate's own 'spawn' subprocess and returns only
-    primitives to the parent -- the candidate never executes in the evaluator's
-    process. TAMPER-RESISTANCE: the comparators and speedup are bound as DEFAULT
-    ARGUMENTS at function-definition time, captured as the original function objects,
-    so a candidate that monkeypatches `tripwire.oracle.close_equal` /
-    `tripwire.measure.*` in that child cannot defeat the verdict (audit finding C1)."""
+    `output_fn(args_tuple) -> output`, if given, is used INSTEAD of calling
+    `cand(*args)`. This is how the HARDENED evaluator runs untrusted code: the oracle
+    (this function, the comparators, the Verdict type) runs in the TRUSTED PARENT,
+    while output_fn ships each input to a sandbox subprocess and returns the
+    candidate's output decoded with a NON-pickle JSON codec. The candidate therefore
+    never executes in this process, cannot reach the oracle/Verdict to fake a verdict,
+    and cannot smuggle a pickle (audit findings C1 / pipe-RCE / Verdict-hijack). It
+    must raise on candidate failure (the oracle treats that as a rejection). When None,
+    the candidate is called in-process (the original trusted path; for tests/trusted
+    code). `cand` may be None when output_fn is provided.
+
+    Comparators/speedup are bound as default args (captured at def-time) as
+    defense-in-depth; with output_fn the candidate isn't in-process anyway."""
     cmp = _exact_equal if t.kind == "structural" else _close_equal
+    call = output_fn if output_fn is not None else (lambda args: cand(*_fresh_args(args)))
     # L1 -- canonical correctness
     for args in t.canonical_args:
         try:
             expected = t.reference(*_fresh_args(args))
-            got = cand(*_fresh_args(args))
+            got = call(args)
             if not cmp(expected, got):
                 return Verdict(False, "L1 canonical mismatch")
         except Exception as e:
@@ -139,7 +147,7 @@ def layered_oracle(
     for pname, pfn in t.properties:
         for args in t.canonical_args + t.withheld_args:
             try:
-                if not pfn(args, cand(*_fresh_args(args))):
+                if not pfn(args, call(args)):
                     return Verdict(False, f"L2 property '{pname}' violated")
             except Exception as e:
                 return Verdict(False, f"L2 raised {type(e).__name__}")
@@ -149,12 +157,15 @@ def layered_oracle(
     for args in t.withheld_args + _generative_withheld(t):
         try:
             expected = t.reference(*_fresh_args(args))
-            got = cand(*_fresh_args(args))
+            got = call(args)
             if not cmp(expected, got):
                 return Verdict(False, "L3 withheld-input differential mismatch")
         except Exception as e:
             return Verdict(False, f"L3 raised {type(e).__name__}")
-    # L4 -- isolated speedup across many shapes (args copied so a mutating candidate
-    # cannot corrupt the shared Target during timing -- H1 at L4).
+    # L4 -- isolated speedup. Only meaningful for the in-process path (output_fn=None);
+    # with isolation, speed is measured separately (see evaluator). Args are copied so
+    # a mutating candidate cannot corrupt the shared Target during timing (H1 at L4).
+    if output_fn is not None:
+        return Verdict(True, "passed all layers", float("nan"))
     timing_args = [_fresh_args(a) for a in t.canonical_args + t.withheld_args]
     return Verdict(True, "passed all layers", _speedup(t.reference, cand, timing_args))

@@ -1,177 +1,386 @@
-"""tripwire.isolation -- evaluate untrusted candidate code in a FRESH subprocess,
-returning ONLY primitive, trusted values across the process boundary.
+"""tripwire.isolation -- run untrusted candidate code in a sandbox subprocess that
+emits ONLY its raw outputs, serialized with a NON-pickle (JSON) codec.
 
-Why this exists (audit history)
---------------------------------
-The original evaluator imported and CALLED the candidate in the SAME interpreter as
-the oracle, so a candidate could monkeypatch the oracle's comparators and "mark its
-own homework" (the Sakana exploit). The first hardening attempt ran the candidate in
-a subprocess but shipped the candidate's OUTPUT objects back to the parent over an
-mp.Pipe -- which made the PARENT unpickle attacker-controlled data, an arbitrary
-code-execution hole (a malicious `__reduce__` runs in the trusted parent). It also
-still imported the candidate in-parent to time it.
+Audit history (three rounds; learn from it)
+--------------------------------------------
+* The original evaluator ran the candidate in-process with the oracle -> a candidate
+  could monkeypatch the comparators and "mark its own homework" (Sakana exploit).
+* Round 1 ran the candidate in a subprocess but shipped its OUTPUT OBJECTS back over
+  an mp.Pipe -> the PARENT unpickled attacker data (a malicious __reduce__ ran in the
+  parent). It also imported the candidate in-parent to time it.
+* Round 2 ran the FULL oracle in the child and returned "only primitives" -> but the
+  untrusted candidate shared that child's interpreter, so it could (a) grab the live
+  pipe Connection via gc and send an arbitrary pickle to the parent, and (b) rebind
+  `tripwire.oracle.Verdict` so every internal `Verdict(False, ...)` became accepted.
 
-The sound design (this module)
--------------------------------
-The CHILD process does the ENTIRE evaluation and returns only THREE PRIMITIVES:
-`(accepted: bool, reason: str, speedup: float)`. The parent unpickles nothing the
-candidate controls -- only those primitives -- so there is no deserialization RCE,
-and the candidate never executes in the parent at all.
+The invariant those rounds violated
+------------------------------------
+Untrusted candidate code must NEVER share an interpreter with (1) the verdict logic
+or (2) any handle that can send pickled objects to the parent. Process isolation
+alone is not enough if the verdict logic or the IPC handle is co-resident.
 
-Inside the child, the trusted machinery is captured into LOCAL variables BEFORE the
-candidate module is imported, so the candidate's module-level code cannot monkeypatch
-what the child uses to judge it:
-  * the reference function and comparators are imported and bound to locals first,
-  * then the candidate is loaded,
-  * then the oracle logic runs using those captured locals.
-A candidate that patches `tripwire.oracle.close_equal` in the child patches a name
-the child's evaluation no longer reads; and the child is a throwaway interpreter
-discarded immediately after, so any damage is contained.
+This design (round 3)
+---------------------
+The CHILD is a DUMB WORKER: it loads the candidate and, for each input the parent
+sends, CALLS the candidate and writes back its output ENCODED AS JSON BYTES. The
+child runs NO oracle logic -- there is no Verdict to hijack and no verdict to fake;
+the child only produces outputs.
 
-Crashes / hangs / fork-bombs take down only the child; the parent observes EOF or a
-timeout and reports a clean failure (-> rejected, score 0.0).
+The PARENT (trusted) runs the entire `layered_oracle`; its candidate-calling goes
+through `output_fn`, which sends one input and reads back the JSON-decoded output.
+The parent reads LENGTH-PREFIXED RAW BYTES and decodes them with `json.loads` -- it
+NEVER calls pickle on anything from the child. Therefore:
+  * a malicious object cannot survive the JSON boundary (no __reduce__ path),
+  * even if the candidate grabs the child's socket and writes arbitrary bytes, the
+    worst it can do is produce JSON the parent treats as a (wrong) output -> rejected,
+  * the candidate never touches the oracle, comparators, or Verdict (all in parent),
+  * inputs cross parent->child as JSON too, so the child reconstructs them locally.
 
-Used only by tripwire/evaluator.py (Interface B). The in-process oracle
-(tripwire/oracle.py) is unchanged and still used directly for trusted code + tests.
+A numpy-aware codec handles our domains (numbers, strings, bools, None, lists, dicts,
+tuples, and ndarrays as {"__ndarray__": ..., "dtype": ...}). Anything a candidate
+returns that is not JSON-encodable by this codec is reported as a failure (rejected),
+never as a passing verdict.
+
+Crashes / hangs / fork-bombs: a per-call timeout bounds the parent's read; on timeout
+or EOF the candidate is rejected and the child's whole PROCESS GROUP is killed
+(so detached grandchildren can't outlive it).
 """
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
-from dataclasses import dataclass
+import os
+import signal
+import struct
 
-# Fresh interpreter per candidate. 'spawn' does not fork parent memory, so the child
-# starts from a clean import state the parent cannot have pre-poisoned.
+import numpy as np
+
+# Fresh interpreter per candidate. 'spawn' => the child starts clean.
 _CTX = mp.get_context("spawn")
 
-DEFAULT_TIMEOUT = 30.0  # seconds for the whole child evaluation; exceeding it = fail
-
-# Entrypoint names a candidate may expose (kept in sync with the evaluator).
+DEFAULT_TIMEOUT = 30.0  # seconds per candidate call
 CANONICAL_ENTRYPOINT = "solve"
+_MAX_MSG = 256 * 1024 * 1024  # 256 MiB hard cap on a single decoded message
 
 
-@dataclass
-class IsolatedVerdict:
-    """The trusted, primitives-only result the parent receives from the child.
-    `speedup` is finite only when accepted; NaN/inf are normalized by the parent."""
+# ---------------------------------------------------------------------------
+# JSON codec (numpy-aware). NO pickle anywhere on this path.
+# ---------------------------------------------------------------------------
+def _encode(obj):
+    """Convert an output into JSON-safe primitives. ndarrays -> tagged dict. Raises
+    TypeError on anything unsupported (caller treats that as a candidate failure)."""
+    if isinstance(obj, np.ndarray):
+        return {"__ndarray__": obj.tolist(), "dtype": str(obj.dtype), "shape": list(obj.shape)}
+    if isinstance(obj, np.generic):  # numpy scalar
+        return obj.item()
+    if isinstance(obj, (str, bool, int, float)) or obj is None:
+        return obj
+    if isinstance(obj, (list, tuple)):
+        return {"__seq__": type(obj).__name__, "items": [_encode(x) for x in obj]}
+    if isinstance(obj, dict):
+        return {"__dict__": [[_encode(k), _encode(v)] for k, v in obj.items()]}
+    raise TypeError(f"unencodable output type: {type(obj).__name__}")
 
-    accepted: bool
-    reason: str
-    speedup: float
+
+def _decode(obj):
+    """Inverse of _encode. Operates only on JSON primitives (parsed by json.loads),
+    so there is no code-execution path here -- the worst malformed input yields a
+    wrong/!=-reference value, never code execution."""
+    if isinstance(obj, dict):
+        if "__ndarray__" in obj:
+            arr = np.array(obj["__ndarray__"], dtype=obj.get("dtype"))
+            shape = obj.get("shape")
+            if shape is not None:
+                arr = arr.reshape(shape)
+            return arr
+        if "__seq__" in obj:
+            items = [_decode(x) for x in obj["items"]]
+            return tuple(items) if obj["__seq__"] == "tuple" else items
+        if "__dict__" in obj:
+            return {_decode(k): _decode(v) for k, v in obj["__dict__"]}
+        return obj  # plain JSON object
+    if isinstance(obj, list):
+        return [_decode(x) for x in obj]
+    return obj
 
 
-def _child_evaluate(program_path, target_factory_ref, entrypoint_names, conn):
-    """Runs IN THE CHILD. Performs the FULL layered-oracle evaluation and sends back
-    only (accepted, reason, speedup) as primitives. See module docstring for why the
-    trusted functions are captured into locals before the candidate is imported.
+def _send(sock, payload_bytes: bytes) -> None:
+    sock.sendall(struct.pack("!Q", len(payload_bytes)) + payload_bytes)
 
-    `target_factory_ref` is a ('module', 'attr') pair naming a zero-arg factory that
-    rebuilds the Target fresh in this process (Targets contain callables/closures and
-    are reconstructed here rather than pickled across)."""
+
+def _recv(sock, timeout: float) -> bytes | None:
+    """Read one length-prefixed message with a wall-clock bound. Returns None on
+    timeout / EOF / oversize. Reads RAW BYTES only; decoding is the caller's job
+    (and is JSON, never pickle)."""
+    sock.settimeout(timeout)
     try:
-        import importlib
+        header = _recv_exact(sock, 8, timeout)
+        if header is None:
+            return None
+        (length,) = struct.unpack("!Q", header)
+        if length > _MAX_MSG:
+            return None
+        return _recv_exact(sock, length, timeout)
+    except (TimeoutError, OSError):
+        return None
 
-        # --- capture TRUSTED machinery into locals BEFORE loading the candidate ---
-        oracle_mod = importlib.import_module("tripwire.oracle")
-        layered = oracle_mod.layered_oracle  # uses measure.* bound at its import time
 
-        mod_name, attr = target_factory_ref
-        target = getattr(importlib.import_module(mod_name), attr)()
+def _recv_exact(sock, n: int, timeout: float) -> bytes | None:
+    import time as _time
 
-        # --- now load the (untrusted) candidate ---
+    chunks = []
+    got = 0
+    deadline = _time.monotonic() + timeout
+    while got < n:
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            return None
+        sock.settimeout(remaining)
+        try:
+            chunk = sock.recv(min(n - got, 1 << 20))
+        except (TimeoutError, OSError):
+            return None
+        if not chunk:
+            return None  # EOF
+        chunks.append(chunk)
+        got += len(chunk)
+    return b"".join(chunks)
+
+
+# ---------------------------------------------------------------------------
+# Child worker: load candidate, then loop {recv JSON input -> call -> send JSON out}.
+# Runs NO oracle logic. The candidate may do whatever it wants here; it cannot reach
+# the parent's oracle, and its only output channel is JSON bytes.
+# ---------------------------------------------------------------------------
+def _worker(program_path, entrypoint_names, sock):
+    # Become our own process-group / session leader so the parent can reap the WHOLE
+    # group (incl. any forks the candidate detaches) with killpg on timeout/exit.
+    try:
+        os.setsid()
+    except OSError:
+        pass
+    try:
         import importlib.util
 
         spec = importlib.util.spec_from_file_location("candidate", program_path)
         if spec is None or spec.loader is None:
-            conn.send((False, "load failed: no spec", 0.0))
+            _send(sock, json.dumps({"status": "fatal", "reason": "load failed: no spec"}).encode())
             return
         mod = importlib.util.module_from_spec(spec)
         try:
             spec.loader.exec_module(mod)
         except Exception as e:
-            conn.send((False, f"load failed: {type(e).__name__}", 0.0))
+            _send(sock, json.dumps(
+                {"status": "fatal", "reason": f"load failed: {type(e).__name__}"}).encode())
             return
-
         fn = None
         for name in entrypoint_names:
             fn = getattr(mod, name, None)
             if fn is not None:
                 break
-        if fn is None:
-            conn.send((False, "no entrypoint", 0.0))
+        if fn is None or not callable(fn):
+            reason = "no entrypoint" if fn is None else "entrypoint not callable"
+            _send(sock, json.dumps({"status": "fatal", "reason": reason}).encode())
             return
-        if not callable(fn):
-            conn.send((False, "entrypoint not callable", 0.0))
-            return
+        _send(sock, json.dumps({"status": "ready"}).encode())
 
-        # --- full oracle evaluation in the child; only primitives leave ---
-        verdict = layered(target, fn)
-        sp = float(verdict.speedup)
-        # normalize non-finite to a safe primitive (parent re-checks anyway)
-        if sp != sp or sp in (float("inf"), float("-inf")):
-            sp = float("inf") if sp == float("inf") else (0.0 if sp != sp else sp)
-        conn.send((bool(verdict.accepted), str(verdict.reason), sp))
-    except Exception as e:  # last-resort: never hang the parent
+        while True:
+            raw = _recv(sock, timeout=3600)  # child waits for parent; parent bounds total time
+            if raw is None:
+                return
+            msg = json.loads(raw)
+            cmd = msg.get("cmd")
+            if cmd == "stop":
+                return
+            if cmd == "time":
+                # Time the candidate INSIDE the child (best-of-repeats per input set),
+                # returning only the elapsed seconds (a float). Keeps timing honest
+                # (no IPC overhead) and the candidate out of the parent.
+                import time as _t
+
+                arg_sets = [tuple(_decode(a) for a in s) for s in msg["arg_sets"]]
+                repeats = int(msg.get("repeats", 5))
+                try:
+                    for a in arg_sets:  # warmup
+                        fn(*a)
+                    total = 0.0
+                    for a in arg_sets:
+                        best = float("inf")
+                        for _ in range(repeats):
+                            t0 = _t.perf_counter()
+                            fn(*a)
+                            best = min(best, _t.perf_counter() - t0)
+                        total += best
+                    _send(sock, json.dumps({"status": "ok", "elapsed": float(total)}).encode())
+                except Exception as e:
+                    _send(sock, json.dumps(
+                        {"status": "err", "reason": f"raised {type(e).__name__}"}).encode())
+                continue
+            args = tuple(_decode(a) for a in msg["args"])
+            try:
+                out = fn(*args)
+                encoded = _encode(out)  # may raise TypeError -> reported as err
+                _send(sock, json.dumps({"status": "ok", "output": encoded}).encode())
+            except TypeError as e:
+                _send(sock, json.dumps(
+                    {"status": "err", "reason": f"unencodable: {type(e).__name__}"}).encode())
+            except Exception as e:
+                _send(sock, json.dumps(
+                    {"status": "err", "reason": f"raised {type(e).__name__}"}).encode())
+    except Exception:
+        # last-resort: stay silent; the parent will see EOF/timeout and reject.
+        pass
+    finally:
         try:
-            conn.send((False, f"child error: {type(e).__name__}", 0.0))
+            sock.close()
         except Exception:
             pass
-    finally:
-        conn.close()
 
 
-def evaluate_isolated(
-    program_path: str,
-    target_factory_ref: tuple[str, str],
-    entrypoint_names=None,
-    timeout: float = DEFAULT_TIMEOUT,
-) -> IsolatedVerdict:
-    """Evaluate `program_path` against the Target produced by `target_factory_ref`
-    (a ('module','factory_attr') pair) entirely inside a fresh subprocess. Returns an
-    IsolatedVerdict built from PRIMITIVES only. Never raises; all failure modes
-    (load error, crash, segfault, fork-bomb death, timeout) map to accepted=False."""
-    if entrypoint_names is None:
-        entrypoint_names = [CANONICAL_ENTRYPOINT]
-    parent_conn, child_conn = _CTX.Pipe(duplex=False)
-    proc = _CTX.Process(
-        target=_child_evaluate,
-        args=(program_path, tuple(target_factory_ref), list(entrypoint_names), child_conn),
-        daemon=True,
-    )
-    proc.start()
-    child_conn.close()  # parent only reads
+class CandidateError(Exception):
+    """Raised in the PARENT by IsolatedCandidate.output_fn on any sandbox failure
+    (load error, raise, crash, timeout, unencodable/garbage output). The oracle's
+    per-layer try/except turns it into a rejection."""
 
-    result = None
-    if parent_conn.poll(timeout):
+
+class IsolatedCandidate:
+    """Context manager: starts a sandbox worker for `program_path` and exposes
+    `output_fn(args) -> output`. Pass `.output_fn` to `layered_oracle(..., output_fn=)`.
+
+    The parent decodes worker replies with json.loads + a numpy-aware decoder -- never
+    pickle -- so nothing the candidate emits can execute code in the parent."""
+
+    def __init__(self, program_path, entrypoint_names=None, timeout=DEFAULT_TIMEOUT):
+        self.program_path = program_path
+        self.entrypoint_names = list(entrypoint_names or [CANONICAL_ENTRYPOINT])
+        self.timeout = timeout
+        self._proc = None
+        self._sock = None
+        self.load_error: str | None = None
+        self._dead = False
+
+    def __enter__(self):
+        import socket
+
+        # A socketpair carries LENGTH-FRAMED RAW BYTES (json), not picklable
+        # Connection objects -- so even if the candidate grabs the child's socket, the
+        # parent only ever json.loads() what it reads.
+        p_sock, c_sock = socket.socketpair()
+        self._sock = p_sock
+        self._proc = _CTX.Process(
+            target=_worker,
+            args=(self.program_path, self.entrypoint_names, c_sock),
+            daemon=False,  # we reap the process group ourselves on exit/timeout
+        )
+        self._proc.start()
+        c_sock.close()  # parent keeps p_sock only
+        # await readiness / load result
+        raw = _recv(self._sock, self.timeout)
+        if raw is None:
+            self.load_error, self._dead = "load timeout", True
+            return self
         try:
-            payload = parent_conn.recv()
-        except EOFError:
-            payload = None  # child died without sending (segfault / killed)
-        # Defensively validate the shape/types -- the child is trusted code, but be
-        # strict so a corrupted message can never become a nonzero score.
-        if (
-            isinstance(payload, tuple)
-            and len(payload) == 3
-            and isinstance(payload[0], bool)
-            and isinstance(payload[1], str)
-            and isinstance(payload[2], (int, float))
-        ):
-            result = payload
-    else:
-        result = ("__timeout__",)  # sentinel
+            msg = json.loads(raw)
+        except Exception:
+            self.load_error, self._dead = "load failed: bad handshake", True
+            return self
+        if msg.get("status") == "ready":
+            return self
+        self.load_error = msg.get("reason", "load failed")
+        self._dead = True
+        return self
 
-    parent_conn.close()
-    proc.join(timeout=1.0)
-    if proc.is_alive():
-        proc.terminate()
-        proc.join(timeout=1.0)
+    def output_fn(self, args):
+        if self.load_error is not None:
+            raise CandidateError(self.load_error)
+        if self._dead or self._sock is None:
+            raise CandidateError("crashed")
+        try:
+            payload = json.dumps({"args": [_encode(a) for a in args]}).encode()
+        except TypeError as e:
+            # An input we can't encode is our bug, not the candidate's; surface clearly.
+            raise CandidateError(f"uninputtable: {type(e).__name__}") from None
+        try:
+            _send(self._sock, payload)
+        except OSError:
+            self._dead = True
+            raise CandidateError("crashed") from None
+        raw = _recv(self._sock, self.timeout)
+        if raw is None:
+            self._dead = True
+            raise CandidateError("timeout")
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            self._dead = True
+            raise CandidateError("garbage output") from None
+        status = msg.get("status")
+        if status == "ok":
+            return _decode(msg["output"])
+        if status == "err":
+            raise CandidateError(msg.get("reason", "error"))
+        self._dead = True
+        raise CandidateError(msg.get("reason", "fatal"))
 
-    if result is None:
-        return IsolatedVerdict(False, "crashed", 0.0)
-    if result == ("__timeout__",):
-        return IsolatedVerdict(False, "timeout", 0.0)
+    def time_fn(self, arg_sets, repeats: int = 5) -> float:
+        """Total best-of-`repeats` wall time of the candidate over `arg_sets`,
+        measured INSIDE the sandbox (no IPC overhead; candidate stays out of the
+        parent). Raises CandidateError on failure. Used only AFTER correctness passes,
+        to compute speedup against an in-parent reference timing."""
+        if self._dead or self._sock is None:
+            raise CandidateError("crashed")
+        payload = json.dumps(
+            {"cmd": "time", "arg_sets": [[_encode(a) for a in s] for s in arg_sets],
+             "repeats": repeats}
+        ).encode()
+        try:
+            _send(self._sock, payload)
+        except OSError:
+            self._dead = True
+            raise CandidateError("crashed") from None
+        raw = _recv(self._sock, self.timeout)
+        if raw is None:
+            self._dead = True
+            raise CandidateError("timeout")
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            self._dead = True
+            raise CandidateError("garbage output") from None
+        if msg.get("status") == "ok":
+            return float(msg["elapsed"])
+        raise CandidateError(msg.get("reason", "error"))
 
-    accepted, reason, sp = result
-    sp = float(sp)
-    if not accepted:
-        sp = 0.0
-    return IsolatedVerdict(accepted=accepted, reason=reason, speedup=sp)
+    def __exit__(self, *exc):
+        try:
+            if self._sock is not None and not self._dead:
+                try:
+                    _send(self._sock, json.dumps({"cmd": "stop"}).encode())
+                except Exception:
+                    pass
+            if self._sock is not None:
+                self._sock.close()
+        finally:
+            self._reap()
+        return False
+
+    def _reap(self):
+        """Kill the worker AND its process group so detached grandchildren can't
+        outlive it (audit finding: orphaned grandchild survives terminate())."""
+        if self._proc is None:
+            return
+        self._proc.join(timeout=1.0)
+        if self._proc.is_alive():
+            self._proc.terminate()
+            self._proc.join(timeout=1.0)
+        if self._proc.is_alive():
+            self._proc.kill()
+            self._proc.join(timeout=1.0)
+        # best-effort: reap the child's process group (it's its own session leader
+        # only if it called setsid; we kill the pid's group to catch raw forks).
+        try:
+            pid = self._proc.pid
+            if pid is not None:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass

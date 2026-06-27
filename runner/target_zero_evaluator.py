@@ -18,13 +18,12 @@ from tripwire.evaluator import make_openevolve_evaluator
 from tripwire.targets.sum_reduction import make_target
 
 # Build the target + oracle-backed evaluator once at import time. isolate=True (the
-# default) runs each evolved candidate in a fresh subprocess; we pass the factory
-# reference explicitly so the child can rebuild the Target (the candidate -- untrusted
-# LLM-generated code -- therefore never executes in this evaluator process).
+# default) runs each evolved candidate in a sandbox subprocess that emits only its
+# JSON-encoded outputs; the layered oracle runs in THIS process and compares them to
+# the reference. The candidate (untrusted LLM-generated code) therefore never executes
+# in this evaluator process and cannot tamper with the oracle.
 _TARGET = make_target()
-_EVALUATE = make_openevolve_evaluator(
-    _TARGET, target_factory_ref=("tripwire.targets.sum_reduction", "make_target")
-)
+_EVALUATE = make_openevolve_evaluator(_TARGET)
 
 
 def evaluate(program_path: str) -> dict:
