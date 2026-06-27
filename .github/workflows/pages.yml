@@ -28,9 +28,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: npm
-          cache-dependency-path: viz/package-lock.json
-      - run: npm ci
+      # No `npm ci` / package-lock.json: the lockfile is intentionally not
+      # tracked because the maintainer's local npm is pinned to a private
+      # registry mirror that poisons lockfile `resolved:` URLs. The runner
+      # resolves against public npm every build; the dep set is small and
+      # pinned to caret-stable versions in package.json.
+      - run: npm install --no-audit --no-fund
       - run: npm run build
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
