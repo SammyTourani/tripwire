@@ -467,13 +467,34 @@ class IsolatedCandidate:
         return data
 
     def _send(self, payload: dict) -> None:
+        """Write a framed JSON message to the child's stdin. Like _recv, this is
+        bounded by self.timeout: if the child isn't draining stdin (e.g. it's hung
+        in fn(*args)), the pipe buffer fills up and write() blocks. A watcher thread
+        kills the process group after the deadline so write() unblocks with EPIPE."""
         if self._dead or self._proc is None or self._proc.stdin is None:
             raise CandidateError("crashed")
+        import threading
+
+        deadline = time.monotonic() + self.timeout
+        killed = {"v": False}
+
+        def watcher():
+            while time.monotonic() < deadline:
+                time.sleep(0.05)
+                if killed["v"]:
+                    return
+            self._kill_group()
+            killed["v"] = True
+
+        t = threading.Thread(target=watcher, daemon=True)
+        t.start()
         try:
             _write_msg(self._proc.stdin, json.dumps(payload).encode())
         except (BrokenPipeError, OSError):
             self._dead = True
             raise CandidateError("crashed") from None
+        finally:
+            killed["v"] = True
 
     # ---- public API used by the oracle ----
     def output_fn(self, args):
