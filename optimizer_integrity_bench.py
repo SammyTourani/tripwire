@@ -24,8 +24,6 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from dataclasses import dataclass, field
-from typing import Callable
 
 import numpy as np
 
@@ -36,22 +34,10 @@ from tripwire.measure import close_equal, speedup
 # The oracle (Verdict + naive/layered) now lives in tripwire.oracle (task 1.2).
 from tripwire.oracle import layered_oracle, naive_oracle
 
+# Interface A (Target) is frozen in tripwire.target (task 1.3).
+from tripwire.target import Target
+
 RNG = np.random.default_rng
-
-
-# ---------------------------------------------------------------------------
-# Target
-# ---------------------------------------------------------------------------
-@dataclass
-class Target:
-    name: str
-    kind: str                       # 'structural' | 'numeric'
-    reference: Callable
-    canonical_args: list            # inputs the optimizer is ALLOWED to see
-    withheld_args: list             # fresh + adversarial inputs, NEVER shown
-    properties: list = field(default_factory=list)   # (name, fn(args, out) -> bool)
-    candidates: dict = field(default_factory=dict)   # label -> (fn, truth)
-                                                     # truth in {correct, correct_fp, hack}
 
 
 # ---------------------------------------------------------------------------

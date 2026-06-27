@@ -19,20 +19,17 @@ measured after L1-L3 pass.
 
 This module is duck-typed on the Target contract (Interface A, frozen in task
 1.3): it reads `.kind`, `.reference`, `.canonical_args`, `.withheld_args`, and
-`.properties`. It deliberately does NOT import Target at runtime -- the oracle is
-the stable core that the Target plug-in depends on, not the other way round.
-There is NO evolutionary-search / population / archive code here (HARD RULE 1).
+`.properties`. It imports Target only for type annotations -- target.py has no
+dependency on oracle.py, so there is no import cycle. There is NO
+evolutionary-search / population / archive code here (HARD RULE 1).
 """
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from tripwire.measure import close_equal, exact_equal, speedup
-
-if TYPE_CHECKING:  # annotation only -- avoids a runtime dependency on the Target module
-    from optimizer_integrity_bench import Target
+from tripwire.target import Target
 
 
 @dataclass
