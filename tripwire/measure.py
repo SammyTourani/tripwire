@@ -228,27 +228,229 @@ def speedup_stats(
 
 # ---------------------------------------------------------------------------
 # Comparison primitives
+#
+# Both comparators are adversarial-by-design oracle primitives (CLAUDE.md §5,
+# HARD RULE 2): assume the value on either side is a candidate trying to slip past
+# the comparison. Two cross-cutting guarantees they share:
+#
+#   * TOTAL -- neither ever raises. The oracle wraps them in try/except, but a
+#     comparator that can raise is a latent bug, so every path returns a bool and
+#     any unexpected type falls back to a safe ``type(a) is type(b) and a == b``.
+#   * NaN is EQUAL to NaN (position-wise for arrays). A correct reference that
+#     legitimately produces NaN (an all-NULL aggregate, a reduction over data with
+#     NaN) must not be rejected just because ``nan != nan`` in IEEE-754 -- that is
+#     exactly the false-negative axis this project exists to kill (ADR-004). A NaN
+#     is still UNEQUAL to any finite number. +Inf == +Inf and -Inf == -Inf, but
+#     +Inf != -Inf, in both comparators.
+#
+# They differ on the leaf rule: `exact_equal` is TYPE-STRICT (structural targets,
+# where exact is sound and free -- ADR-004), `close_equal` applies a tolerance to
+# numeric leaves (numeric targets, where reordered FP arithmetic changes low bits).
 # ---------------------------------------------------------------------------
+
+# Container types we recurse through so the leaf rule applies element-wise.
+_SEQ_TYPES = (list, tuple)
+
+
+def _is_real_number(x) -> bool:
+    """True for a non-bool Python/numpy real scalar. bool is excluded on purpose:
+    for type-strict structural compares ``True`` is NOT ``1`` (Defect 1), and for
+    numeric compares a bool leaf is treated structurally, not as 0.0/1.0."""
+    if isinstance(x, bool) or isinstance(x, np.bool_):
+        return False
+    return isinstance(x, (int, float, np.integer, np.floating))
+
+
+def _both_nan(a, b) -> bool:
+    """True iff both `a` and `b` are NaN scalars. Used to make NaN==NaN hold at the
+    leaf level. Guarded so non-float inputs (e.g. strings) never reach math.isnan."""
+    try:
+        return (
+            _is_real_number(a)
+            and _is_real_number(b)
+            and math.isnan(float(a))
+            and math.isnan(float(b))
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _scalar_close(a, b, rtol: float, atol: float) -> bool:
+    """Tolerance compare for two real scalars, with NaN==NaN and signed-Inf rules
+    handled exactly the way ``np.allclose(equal_nan=True)`` does -- reused so the
+    scalar path and the array path agree."""
+    fa, fb = float(a), float(b)
+    if math.isnan(fa) or math.isnan(fb):
+        return math.isnan(fa) and math.isnan(fb)  # NaN==NaN, NaN!=number
+    if math.isinf(fa) or math.isinf(fb):
+        return fa == fb  # +inf==+inf, -inf==-inf, but +inf!=-inf and inf!=finite
+    return abs(fa - fb) <= (atol + rtol * abs(fb))
+
+
+def _arrays_exact_equal(a: np.ndarray, b: np.ndarray) -> bool:
+    """Type-strict array equality for `exact_equal`.
+
+    Requires matching dtype KIND (an int array is not equal to an equal-valued
+    float array -- 'exact' means type-exact), then compares values with
+    ``np.array_equal`` while treating NaN positions as equal. ``np.array_equal``
+    does not broadcast, so an array is never silently 'equal' to a scalar."""
+    if a.dtype.kind != b.dtype.kind:
+        return False
+    if a.shape != b.shape:
+        return False
+    # equal_nan only works for inexact (float/complex) kinds; for everything else
+    # (ints, bytes, str, bool, object) a plain array_equal is already exact.
+    if a.dtype.kind in ("f", "c"):
+        return bool(np.array_equal(a, b, equal_nan=True))
+    return bool(np.array_equal(a, b))
+
+
+def _arrays_close(a: np.ndarray, b: np.ndarray, rtol: float, atol: float) -> bool:
+    """Tolerance array equality for `close_equal`. Requires MATCHING SHAPES (no
+    broadcast -- a scalar/short vector must not be 'close' to a longer one, Defect 3)
+    and treats NaN positions as equal (``equal_nan=True``, Defect 2)."""
+    if a.shape != b.shape:
+        return False
+    return bool(np.allclose(a, b, rtol=rtol, atol=atol, equal_nan=True))
+
+
+def _safe_eq(a, b) -> bool:
+    """The TOTAL fallback used by both comparators on any unexpected type: equal
+    only if the types match exactly AND ``==`` says so, swallowing any exception a
+    weird ``__eq__`` might raise (and coercing a truthy/array-like result to bool)."""
+    if type(a) is not type(b):
+        return False
+    try:
+        return bool(a == b)
+    except Exception:
+        return a is b
+
+
 def exact_equal(a, b) -> bool:
-    """Bit-exact comparison. SOUND ONLY for `structural` targets (ADR-004)."""
+    """Type-strict, NaN-aware, TOTAL exact comparison. SOUND ONLY for `structural`
+    targets (ADR-004), where 'exact' must mean *type-exact*.
+
+    Type-strictness (Defect 1): values of different types are NEVER equal. In
+    particular ``1`` (int) != ``1.0`` (float) != ``True`` (bool), ``"1"`` != ``1``,
+    a tuple is not a list with the same contents, and a dict whose values differ in
+    type (``{"a": 1}`` vs ``{"a": 1.0}``) is not equal. This stops a candidate that
+    returns ``{"count": True}`` from masquerading as the reference's ``{"count": 1}``.
+
+    NaN (Defect 2): ``nan`` equals ``nan`` (scalar and position-wise in arrays), but
+    a NaN is never equal to a finite number.
+
+    Recursion: list/tuple/dict are compared element-wise so type-strictness applies
+    to every leaf; differing length or key-set => not equal.
+
+    Numpy arrays are compared with matching dtype-kind + shape (an int array is not
+    equal to an equal-valued float array), so no silent scalar/array broadcast.
+
+    TOTAL: never raises; any unexpected type falls back to ``type(a) is type(b) and
+    a == b``.
+    """
+    # --- numpy arrays: type-strict (matching dtype-kind), no broadcast ---
     if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
-        return np.array_equal(np.asarray(a), np.asarray(b))
-    if isinstance(a, float) or isinstance(b, float):
-        return float(a) == float(b)  # bit-exact for floats
-    return a == b
+        if not (isinstance(a, np.ndarray) and isinstance(b, np.ndarray)):
+            return False  # an array is never 'exactly' a bare scalar/list
+        return _arrays_exact_equal(a, b)
+
+    # --- type-strictness gate for everything else: different types => not equal.
+    # (bool vs int and int vs float are distinct because ``type`` distinguishes
+    # them, even though bool subclasses int.)
+    if type(a) is not type(b):
+        return False
+
+    # --- dict: same keys, recurse on values (types now known equal) ---
+    if isinstance(a, dict):
+        if a.keys() != b.keys():
+            return False
+        return all(exact_equal(a[k], b[k]) for k in a)
+
+    # --- list / tuple: same length, recurse element-wise ---
+    if isinstance(a, _SEQ_TYPES):
+        if len(a) != len(b):
+            return False
+        return all(exact_equal(x, y) for x, y in zip(a, b, strict=False))
+
+    # --- real scalars of the SAME type: handle NaN==NaN, else exact ``==`` ---
+    if _is_real_number(a):  # b has the same type here
+        if _both_nan(a, b):
+            return True
+        try:
+            return bool(a == b)
+        except Exception:
+            return a is b
+
+    # --- any other same-typed leaf (str, bytes, bool, None, custom): safe ``==`` ---
+    return _safe_eq(a, b)
 
 
 def close_equal(a, b, rtol: float = 1e-6, atol: float = 1e-9) -> bool:
-    """Tolerance comparison for `numeric` targets (ADR-004): correct speedups
-    (vectorization, reordered reduction, FMA) change low bits."""
-    try:
-        return bool(
-            np.allclose(
-                np.asarray(a, dtype=float),
-                np.asarray(b, dtype=float),
-                rtol=rtol,
-                atol=atol,
-            )
-        )
-    except Exception:
-        return a == b
+    """Tolerance, NaN-aware, structure-aware, TOTAL comparison for `numeric` targets
+    (ADR-004): correct speedups (vectorization, reordered reduction, FMA) change low
+    bits, so numeric correctness is tolerance, never bitwise.
+
+    Numeric leaves are compared with ``rtol``/``atol`` (defaults unchanged). NaN
+    equals NaN and +Inf/-Inf follow the usual signed rules (Defect 2).
+
+    Structured outputs (Defect 3): dict/list/tuple are recursed so the tolerance
+    applies to numeric leaves while non-numeric leaves (strings, bools, keys) use
+    type-strict exact comparison. So ``{"x": 1.0}`` is close to ``{"x": 1.0+1e-9}``
+    -- the bitwise false-negative for non-array numeric output is gone.
+
+    Arrays require MATCHING SHAPES -- no numpy broadcast (Defect 3): a constant
+    scalar is NOT 'close' to a vector reference (``close_equal(np.zeros(200), 0.0)``
+    is False), so a skip-the-work candidate can't match a vector by broadcasting.
+
+    TOTAL: never raises; any unexpected type falls back to ``type(a) is type(b) and
+    a == b``.
+    """
+    return _close_equal(a, b, rtol, atol)
+
+
+def _close_equal(a, b, rtol: float, atol: float) -> bool:
+    """Recursive worker for `close_equal` (keeps the public signature clean)."""
+    # --- numpy arrays: tolerance, matching shapes, equal_nan (no broadcast) ---
+    if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+        try:
+            arr_a = a if isinstance(a, np.ndarray) else np.asarray(a, dtype=float)
+            arr_b = b if isinstance(b, np.ndarray) else np.asarray(b, dtype=float)
+            # numeric arrays compare by tolerance; non-numeric (str/object) exactly.
+            if arr_a.dtype.kind in ("f", "c", "i", "u") and arr_b.dtype.kind in (
+                "f",
+                "c",
+                "i",
+                "u",
+            ):
+                return _arrays_close(arr_a, arr_b, rtol, atol)
+            return _arrays_exact_equal(arr_a, arr_b)
+        except Exception:
+            return _safe_eq(a, b)
+
+    # --- dict: same keys, recurse on values ---
+    if isinstance(a, dict) and isinstance(b, dict):
+        if a.keys() != b.keys():
+            return False
+        return all(_close_equal(a[k], b[k], rtol, atol) for k in a)
+    if isinstance(a, dict) != isinstance(b, dict):
+        return False  # one dict, one not
+
+    # --- list / tuple: same concrete type + length, recurse element-wise ---
+    if isinstance(a, _SEQ_TYPES) or isinstance(b, _SEQ_TYPES):
+        if type(a) is not type(b) or len(a) != len(b):
+            return False
+        return all(_close_equal(x, y, rtol, atol) for x, y in zip(a, b, strict=False))
+
+    # --- two real scalars: tolerance with NaN/Inf semantics ---
+    if _is_real_number(a) and _is_real_number(b):
+        try:
+            return _scalar_close(a, b, rtol, atol)
+        except Exception:
+            return _safe_eq(a, b)
+
+    # --- a real number vs a non-number (e.g. None, str): not close ---
+    if _is_real_number(a) != _is_real_number(b):
+        return False
+
+    # --- any other leaf (str, bytes, bool, None, custom): type-strict safe ``==`` ---
+    return _safe_eq(a, b)
