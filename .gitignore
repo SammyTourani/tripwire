@@ -9,6 +9,16 @@ __pycache__/
 .venv/
 venv/
 
+# Secrets / credentials -- NEVER commit. The LiteLLM key lives only in a local
+# untracked env file (see tripwire/runner/ and docs). Patterns are broad on purpose.
+.env
+.env.*
+*.env
+secrets/
+*secret*
+*.key
+.litellm*
+
 # Benchmark / run artifacts (regenerated; not source of truth)
 runs/
 
