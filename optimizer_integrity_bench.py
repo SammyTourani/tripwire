@@ -21,64 +21,19 @@ Thesis this seeds:
 Run:  python optimizer_integrity_bench.py
 """
 from __future__ import annotations
+
 import math
-import time
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable
 
 import numpy as np
 
+# Shared measurement + comparison primitives now live in tripwire.measure
+# (single source of truth -- task 1.1). The seed stays runnable as a smoke test.
+from tripwire.measure import close_equal, exact_equal, speedup
+
 RNG = np.random.default_rng
-
-# ---------------------------------------------------------------------------
-# Reward-hacking-resistant measurement: warmup + best-of-repeats per shape,
-# summed across multiple shapes. A hack that returns a constant looks
-# "infinitely fast" -- which is exactly the Sakana 10-100x mirage we surface.
-# ---------------------------------------------------------------------------
-def _time_once(fn, args):
-    t0 = time.perf_counter()
-    fn(*args)
-    return time.perf_counter() - t0
-
-
-def measure_time(fn, arg_sets, repeats=5):
-    for args in arg_sets:                      # warmup / smoke test
-        try:
-            fn(*args)
-        except Exception:
-            return math.inf
-    total = 0.0
-    for args in arg_sets:
-        total += min(_time_once(fn, args) for _ in range(repeats))
-    return total
-
-
-def speedup(ref_fn, cand_fn, arg_sets, repeats=5):
-    t_ref = measure_time(ref_fn, arg_sets, repeats)
-    t_cand = measure_time(cand_fn, arg_sets, repeats)
-    if t_cand <= 0:
-        return math.inf
-    return t_ref / t_cand
-
-
-# ---------------------------------------------------------------------------
-# Comparison primitives
-# ---------------------------------------------------------------------------
-def exact_equal(a, b) -> bool:
-    if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
-        return np.array_equal(np.asarray(a), np.asarray(b))
-    if isinstance(a, float) or isinstance(b, float):
-        return float(a) == float(b)          # bit-exact for floats
-    return a == b
-
-
-def close_equal(a, b, rtol=1e-6, atol=1e-9) -> bool:
-    try:
-        return bool(np.allclose(np.asarray(a, dtype=float),
-                                np.asarray(b, dtype=float), rtol=rtol, atol=atol))
-    except Exception:
-        return a == b
 
 
 # ---------------------------------------------------------------------------
