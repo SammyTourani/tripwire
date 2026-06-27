@@ -1,5 +1,7 @@
 # Tripwire — visualizer
 
+**Live:** [sammytourani.github.io/tripwire](https://sammytourani.github.io/tripwire/)
+
 An editorial, animated replay of two artifacts:
 
 - **The cross-domain bench scorecard** (`runs/bench-*.jsonl`) — animated version of
@@ -43,6 +45,11 @@ python -m http.server 8000 --directory dist
 Deploy to GitHub Pages / Vercel / Netlify by pointing them at the `dist/`
 directory after `npm run build`. The Vite config uses a relative `base` so the
 build works at any path (`file://`, `/tripwire/`, root).
+
+This repo deploys to GitHub Pages automatically via
+`.github/workflows/pages.yml` on any push to `main` that touches `viz/`.
+`package-lock.json` is intentionally untracked — see the workflow comment for
+why — so CI runs `npm install` against public npm each build.
 
 ## Data
 
