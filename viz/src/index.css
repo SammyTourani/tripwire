@@ -1,0 +1,135 @@
+@import "tailwindcss";
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Design tokens (Tailwind v4 @theme). These are the only colors and sizes
+   anything in the app should reference. Semantic green/red are reserved for
+   the oracle's verdict; do NOT use them as decoration.
+   ────────────────────────────────────────────────────────────────────────── */
+@theme {
+  /* Type stack. Display = Fraunces (variable serif, optical sizes), body =
+     Inter, mono = JetBrains Mono. */
+  --font-display: "Fraunces", ui-serif, Georgia, serif;
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* Neutral palette (warm paper). Used 95% of the time. */
+  --color-paper: #f8f5ee;             /* page background */
+  --color-paper-2: #f1ece1;           /* subtle panel */
+  --color-paper-3: #e6dfd0;           /* hairline / divider */
+  --color-ink: #1a1816;               /* primary text */
+  --color-ink-2: #4b463e;             /* secondary text */
+  --color-ink-3: #7a7268;             /* tertiary text */
+  --color-rule: #cabfa9;              /* axis / rule */
+
+  /* Single accent (used VERY sparingly). */
+  --color-accent: #1f3a5f;            /* deep ink-blue */
+
+  /* Semantic verdict colors. Only inside oracle stamps + bars. */
+  --color-correct: #2d6a4f;           /* genuine win */
+  --color-correct-2: #d6efe1;
+  --color-hack: #9a2a2a;              /* reward hack */
+  --color-hack-2: #f3d6d6;
+  --color-warning: #7c5a17;           /* false-negative discarded */
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Base reset / page defaults. The whole site lives in this typographic shell.
+   ────────────────────────────────────────────────────────────────────────── */
+html {
+  font-family: var(--font-sans);
+  font-feature-settings: "ss01", "ss02", "cv11"; /* Inter alternates */
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  background-color: var(--color-paper);
+  color: var(--color-ink);
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-size: 17px;
+  line-height: 1.6;
+}
+
+/* Variable-axis tuning for Fraunces (optical sizing + slight softness). */
+.font-display {
+  font-feature-settings: "ss01", "ss02";
+  font-variation-settings: "opsz" 144, "SOFT" 100;
+  letter-spacing: -0.02em;
+}
+
+/* Small caps utility used for section labels. */
+.label-eyebrow {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: 11px;
+  line-height: 1;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--color-ink-3);
+}
+
+/* Hairline rule used as a section delimiter. */
+.rule {
+  height: 1px;
+  background: var(--color-paper-3);
+}
+
+/* Tabular numerals everywhere a number appears in a chart axis or stat. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* A small "stamp" effect used by oracle verdict overlays. Box-shadow rather
+   than a hard border, so it sits like an ink stamp on the page. */
+.stamp {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border-radius: 3px;
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.06), inset 0 0 0 1px currentColor;
+}
+.stamp.stamp-shipped {
+  color: var(--color-hack);
+  background: var(--color-hack-2);
+}
+.stamp.stamp-blocked {
+  color: var(--color-correct);
+  background: var(--color-correct-2);
+}
+.stamp.stamp-rejected {
+  color: var(--color-warning);
+  background: #f4e6c8;
+}
+
+/* Selection in line with the palette. */
+::selection {
+  background: var(--color-accent);
+  color: var(--color-paper);
+}
+
+/* Visible focus that doesn't break the typographic feel. */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+
+/* Honor reduced-motion: collapse all motion-component animations to instant. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
