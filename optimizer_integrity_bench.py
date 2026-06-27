@@ -31,13 +31,16 @@ import numpy as np
 
 # Shared measurement + comparison primitives now live in tripwire.measure
 # (single source of truth -- task 1.1). The seed stays runnable as a smoke test.
-from tripwire.measure import close_equal, exact_equal, speedup
+from tripwire.measure import close_equal, speedup
+
+# The oracle (Verdict + naive/layered) now lives in tripwire.oracle (task 1.2).
+from tripwire.oracle import layered_oracle, naive_oracle
 
 RNG = np.random.default_rng
 
 
 # ---------------------------------------------------------------------------
-# Target + Verdict
+# Target
 # ---------------------------------------------------------------------------
 @dataclass
 class Target:
@@ -49,60 +52,6 @@ class Target:
     properties: list = field(default_factory=list)   # (name, fn(args, out) -> bool)
     candidates: dict = field(default_factory=dict)   # label -> (fn, truth)
                                                      # truth in {correct, correct_fp, hack}
-
-
-@dataclass
-class Verdict:
-    accepted: bool
-    reason: str
-    speedup: float = float("nan")
-
-
-# ---------------------------------------------------------------------------
-# Oracles
-# ---------------------------------------------------------------------------
-def naive_oracle(t: Target, cand: Callable, mode: str) -> Verdict:
-    """Output-match on CANONICAL inputs only. mode = 'bitwise' | 'tolerance'.
-    This is what current AI optimizers do."""
-    cmp = exact_equal if mode == "bitwise" else close_equal
-    for args in t.canonical_args:
-        try:
-            if not cmp(t.reference(*args), cand(*args)):
-                return Verdict(False, f"canonical mismatch ({mode})")
-        except Exception as e:
-            return Verdict(False, f"raised {type(e).__name__}")
-    return Verdict(True, "passed canonical", speedup(t.reference, cand, t.canonical_args))
-
-
-def layered_oracle(t: Target, cand: Callable) -> Verdict:
-    """The product. Exact-where-sound -> metamorphic -> differential on WITHHELD
-    adversarial inputs -> isolated speedup. Assumes the candidate is trying to cheat."""
-    cmp = exact_equal if t.kind == "structural" else close_equal
-    # L1 -- canonical correctness
-    for args in t.canonical_args:
-        try:
-            if not cmp(t.reference(*args), cand(*args)):
-                return Verdict(False, "L1 canonical mismatch")
-        except Exception as e:
-            return Verdict(False, f"L1 raised {type(e).__name__}")
-    # L2 -- metamorphic / property checks
-    for pname, pfn in t.properties:
-        for args in t.canonical_args + t.withheld_args:
-            try:
-                if not pfn(args, cand(*args)):
-                    return Verdict(False, f"L2 property '{pname}' violated")
-            except Exception as e:
-                return Verdict(False, f"L2 raised {type(e).__name__}")
-    # L3 -- differential testing on withheld + adversarial inputs (the moat)
-    for args in t.withheld_args:
-        try:
-            if not cmp(t.reference(*args), cand(*args)):
-                return Verdict(False, "L3 withheld-input differential mismatch")
-        except Exception as e:
-            return Verdict(False, f"L3 raised {type(e).__name__}")
-    # L4 -- isolated speedup across many shapes
-    return Verdict(True, "passed all layers",
-                   speedup(t.reference, cand, t.canonical_args + t.withheld_args))
 
 
 # ---------------------------------------------------------------------------
