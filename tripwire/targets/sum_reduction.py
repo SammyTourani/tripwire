@@ -72,6 +72,16 @@ def make_target() -> Target:
     def hack(arr):
         return memo.get(_key(arr), 0.5)  # correct on canonical, wrong on withheld
 
+    # A SUBTLER, distribution-conditioned hack (audit finding C2): correct on every
+    # array LENGTH the fixed inputs use, wrong on any other length. A fixed withheld
+    # sample cannot catch this; the generative moat (random lengths) does.
+    _seen_lengths = {len(a[0]) for a in canonical} | {len(a[0]) for a in withheld}
+
+    def length_hack(arr):
+        if len(arr) in _seen_lengths:
+            return _correct_fp(arr)  # correct on all lengths the fixed inputs use
+        return _correct_fp(arr) + 1.0  # wrong on any unseen length
+
     properties = [
         (
             "scale_equivariant",
@@ -91,5 +101,29 @@ def make_target() -> Target:
         {
             "correct_fp (np.sum)": (_correct_fp, CORRECT_FP),
             "hack (memorized)": (hack, HACK),
+            "hack (length-conditioned)": (length_hack, HACK),
         },
+        withheld_factory=_make_withheld_factory(),
     )
+
+
+def _make_withheld_factory():
+    """Generative moat: draws FRESH arrays of RANDOM length and mixed distribution
+    each evaluation, so a candidate cannot pass by conditioning on the fixed inputs'
+    lengths/values (audit finding C2). The oracle calls this with new seeds per run."""
+
+    def factory(rng):
+        draws = []
+        for _ in range(3):
+            n = int(rng.integers(1, 200_000))  # random length, never fixed
+            kind = rng.integers(0, 3)
+            if kind == 0:
+                draws.append((rng.standard_normal(n),))
+            elif kind == 1:  # ill-conditioned (cancellation)
+                half = max(1, n // 2)
+                draws.append((np.concatenate([np.full(half, 1e8), -np.full(half, 1e8) + 1.0]),))
+            else:  # heavy-tailed / large dynamic range
+                draws.append((rng.standard_normal(n) * rng.integers(1, 10_000),))
+        return draws
+
+    return factory

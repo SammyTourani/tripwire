@@ -33,6 +33,8 @@ import importlib.util
 import math
 from collections.abc import Callable
 
+from tripwire.isolation import DEFAULT_TIMEOUT, IsolatedCandidate
+from tripwire.measure import speedup
 from tripwire.oracle import layered_oracle
 from tripwire.target import Target
 
@@ -49,10 +51,10 @@ def _zero(reason: str) -> dict:
 
 
 def _load_candidate(program_path: str, target: Target) -> Callable | None:
-    """Import the evolved program and return its entrypoint, or None if it cannot
-    be loaded or exposes no entrypoint. A program that raises at import time
-    (syntax error, bad top-level code) must NOT crash the evaluator -- it scores
-    0.0 like any other failure (matches the real OpenEvolve example)."""
+    """Import the evolved program IN-PROCESS and return its entrypoint, or None if it
+    cannot be loaded or exposes no entrypoint. Used only for the trusted/timing path;
+    the security-critical correctness check runs in isolation (see make_..._evaluator).
+    A program that raises at import time must NOT crash the evaluator."""
     spec = importlib.util.spec_from_file_location("candidate", program_path)
     if spec is None or spec.loader is None:
         return None
@@ -61,7 +63,9 @@ def _load_candidate(program_path: str, target: Target) -> Callable | None:
     return getattr(mod, CANONICAL_ENTRYPOINT, None) or getattr(mod, target.name, None)
 
 
-def make_openevolve_evaluator(target: Target) -> Callable[[str], dict]:
+def make_openevolve_evaluator(
+    target: Target, *, isolate: bool = True, timeout: float = DEFAULT_TIMEOUT
+) -> Callable[[str], dict]:
     """Build the OpenEvolve evaluator for `target`.
 
     Returns a callable `evaluate(program_path) -> dict` with keys:
@@ -71,13 +75,46 @@ def make_openevolve_evaluator(target: Target) -> Callable[[str], dict]:
       speedup        : measured speedup (== combined_score on success), 0.0 otherwise.
       reason         : human-readable verdict / failing layer.
 
-    The returned callable is exposed both as `evaluate` (the OpenEvolve naming
-    convention) and via the `.evaluator` attribute (CLAUDE.md Interface B wording
-    and the proven seed). Both refer to the same function.
-    """
+    SECURITY (isolate=True, the default): the candidate is loaded and CALLED in a
+    fresh subprocess (tripwire.isolation), and the layered oracle compares its
+    outputs against the reference in THIS clean process. The candidate therefore
+    never executes in the evaluator's interpreter during the correctness check, so it
+    cannot monkeypatch the oracle's comparators to mark its own homework (audit C1),
+    nor corrupt shared inputs (H1). Only AFTER correctness passes all layers is the
+    candidate run in-process to MEASURE speedup -- by then it is already proven
+    correct, so the worst a tampering candidate can do is inflate its own (already
+    earned) speed number, never earn reward for wrong code.
 
-    def evaluate(program_path: str) -> dict:
-        # --- load the evolved program (failure to load => 0.0, never a crash) ---
+    isolate=False runs the candidate in-process throughout (the original trusted
+    path) -- use only for trusted code / tests, never for untrusted evolved programs.
+
+    The returned callable is exposed both as `evaluate` (OpenEvolve naming) and via
+    the `.evaluator` attribute (CLAUDE.md Interface B wording).
+    """
+    entrypoints = [CANONICAL_ENTRYPOINT, target.name]
+
+    def _evaluate_isolated(program_path: str) -> dict:
+        # Correctness is judged against the candidate's OUTPUTS, computed in a
+        # subprocess the oracle is not reachable from.
+        with IsolatedCandidate(program_path, entrypoints, timeout=timeout) as iso:
+            if iso.load_error is not None:
+                return _zero(iso.load_error)
+            verdict = layered_oracle(target, None, output_fn=iso.output_fn)
+        if not verdict.accepted:
+            return _zero(verdict.reason)
+        # Correctness passed in isolation. Measure speedup with an in-process load
+        # (safe now: a wrong candidate already got 0.0; this only times a proven one).
+        try:
+            cand = _load_candidate(program_path, target)
+        except Exception as e:
+            return _zero(f"load failed: {type(e).__name__}")
+        if not callable(cand):
+            return _zero("no entrypoint")
+        sp = speedup(target.reference, cand, target.canonical_args + target.withheld_args)
+        sp = 0.0 if math.isinf(sp) else sp
+        return {"combined_score": sp, "correct": 1.0, "speedup": sp, "reason": verdict.reason}
+
+    def _evaluate_inprocess(program_path: str) -> dict:
         try:
             cand = _load_candidate(program_path, target)
         except Exception as e:
@@ -86,23 +123,13 @@ def make_openevolve_evaluator(target: Target) -> Callable[[str], dict]:
             return _zero("no entrypoint")
         if not callable(cand):
             return _zero("entrypoint not callable")
-
-        # --- run the layered oracle: correctness BEFORE speed (ADR-006) ---
         verdict = layered_oracle(target, cand)
         if not verdict.accepted:
-            # reward hacking / wrong -> no reward, period. The failing layer is
-            # surfaced in `reason` so the evolver's error side-channel can learn.
             return _zero(verdict.reason)
-
-        # --- correctness passed all layers: credit the verified speedup ---
-        # A near-infinite "speedup" is a red flag, not a winner (HARD RULE 6). The
-        # oracle/measure layer treats an ~instant candidate as inf; we clamp inf to
-        # 0.0 so a memorization mirage that somehow reaches here earns no reward
-        # rather than an unbounded one.
         sp = 0.0 if math.isinf(verdict.speedup) else verdict.speedup
         return {"combined_score": sp, "correct": 1.0, "speedup": sp, "reason": verdict.reason}
 
-    # Expose under both names (see docstring). `evaluator` is the Interface-B /
-    # seed name; `evaluate` is the OpenEvolve convention.
+    evaluate = _evaluate_isolated if isolate else _evaluate_inprocess
+    # Expose under both names (see docstring).
     evaluate.evaluator = evaluate  # type: ignore[attr-defined]
     return evaluate

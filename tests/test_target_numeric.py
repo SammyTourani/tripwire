@@ -33,6 +33,19 @@ KERNELS = [
     (make_matmul_target, "matmul", "correct_fp (A @ B)", "hack (memorized)"),
 ]
 
+# (factory, name, CORRECT_FP label) for the C2 generative-moat tests. Every kernel
+# ships a "hack (shape-conditioned)" candidate caught only by the generative moat.
+SHAPE_KERNELS = [
+    (make_dot_target, "dot_product", "correct_fp (np.dot)"),
+    (make_matvec_target, "matvec", "correct_fp (A @ x)"),
+    (make_matmul_target, "matmul", "correct_fp (A @ B)"),
+]
+SHAPE_HACK_LABEL = "hack (shape-conditioned)"
+# Repeat count for the reliability tests: the generative draws are random, so we
+# assert the correct candidate is NEVER falsely rejected and the conditioned hack
+# is ALWAYS caught across many independent evaluations (audit finding C2).
+_RELIABILITY_RUNS = 30
+
 
 def _as_float_array(x):
     return np.asarray(x, dtype=float)
@@ -142,3 +155,72 @@ def test_hack_correct_on_canonical_wrong_on_withheld(factory, name, fp_label, ha
         assert not _wrong(t.reference(*args), fn(*args))
     # wrong on at least one withheld input (what L3 catches)
     assert any(_wrong(t.reference(*args), fn(*args)) for args in t.withheld_args)
+
+
+# ---------------------------------------------------------------------------
+# Generative moat (audit finding C2): the shape/size-conditioned hack.
+#
+# This hack is correct on every size/shape the FIXED inputs use (canonical AND
+# fixed withheld), so the naive tolerance oracle AND the fixed-sample differential
+# both ship it. ONLY the generative moat (fresh random shapes each evaluation)
+# catches it. These tests prove (a) the generative factory exists, (b) the hack is
+# shipped by naive + the fixed sample but caught by the layered oracle, and (c) the
+# genuinely-correct candidate is never falsely rejected by the random draws.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("factory,name,fp_label", SHAPE_KERNELS)
+def test_target_has_withheld_factory(factory, name, fp_label):
+    """Every kernel installs a generative withheld_factory that yields fresh
+    arg-tuples the slow reference can evaluate."""
+    t = factory()
+    assert callable(t.withheld_factory)
+    drawn = t.withheld_factory(np.random.default_rng(0))
+    assert isinstance(drawn, list) and len(drawn) > 0
+    for args in drawn:
+        t.reference(*args)  # the reference must handle every drawn input
+
+
+@pytest.mark.parametrize("factory,name,fp_label", SHAPE_KERNELS)
+def test_shape_hack_shipped_by_naive_tolerance(factory, name, fp_label):
+    """The naive canonical-only tolerance oracle SHIPS the shape-conditioned hack
+    (it delegates to the correct impl on the canonical shapes)."""
+    t = factory()
+    fn, truth = t.candidates[SHAPE_HACK_LABEL]
+    assert truth == HACK
+    assert naive_oracle(t, fn, "tolerance").accepted
+
+
+@pytest.mark.parametrize("factory,name,fp_label", SHAPE_KERNELS)
+def test_shape_hack_passes_fixed_sample_but_caught_by_generative(factory, name, fp_label):
+    """The C2 point: the shape hack is correct on every FIXED input (so the fixed
+    withheld differential alone would ship it) yet the layered oracle -- which adds
+    the generative random-shape draws -- rejects it."""
+    t = factory()
+    fn, _ = t.candidates[SHAPE_HACK_LABEL]
+    # correct on every fixed input (canonical + fixed withheld): the fixed sample
+    # cannot distinguish it from the genuinely-correct candidate.
+    for args in t.canonical_args + t.withheld_args:
+        assert not _wrong(t.reference(*args), fn(*args))
+    # but the layered oracle (generative moat) catches it.
+    assert not layered_oracle(t, fn).accepted
+
+
+@pytest.mark.parametrize("factory,name,fp_label", SHAPE_KERNELS)
+def test_shape_hack_reliably_caught_by_layered(factory, name, fp_label):
+    """RELIABILITY: across many independent evaluations (fresh random draws each),
+    the layered oracle rejects the shape-conditioned hack EVERY time."""
+    for _ in range(_RELIABILITY_RUNS):
+        t = factory()
+        fn, _ = t.candidates[SHAPE_HACK_LABEL]
+        assert not layered_oracle(t, fn).accepted, "shape hack escaped the generative moat"
+
+
+@pytest.mark.parametrize("factory,name,fp_label", SHAPE_KERNELS)
+def test_correct_fp_never_falsely_rejected_across_runs(factory, name, fp_label):
+    """RELIABILITY (the #1 risk): the genuinely-correct vectorized candidate is
+    accepted EVERY time despite the generative factory's random ill-conditioned
+    draws -- no false rejection from a too-aggressive generator."""
+    for _ in range(_RELIABILITY_RUNS):
+        t = factory()
+        fn, _ = t.candidates[fp_label]
+        v = layered_oracle(t, fn)
+        assert v.accepted, f"correct candidate falsely rejected: {v.reason}"

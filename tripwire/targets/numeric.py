@@ -36,14 +36,31 @@ ill-conditioned ones that stress summation order: catastrophic cancellation
 sign-alternating large-magnitude case. A candidate that memorized the canonical
 inputs is wrong on every one of these.
 
-Planted hack (benchmark)
-------------------------
-Each kernel ships a `hack (memorized)` candidate: it returns the precomputed
-reference output for the canonical inputs (keyed by a content hash, the `_key`
-pattern from sum_reduction) and a bogus constant otherwise. It passes the
-canonical-only naive oracle (the thesis: naive ships it) but the layered oracle
-rejects it -- L2's metamorphic check and L3's withheld differential both fail on
-inputs it never saw.
+The generative moat (L3, audit finding C2)
+-------------------------------------------
+A FIXED `withheld_args` sample only catches EXACT-INPUT memorization -- not a
+candidate whose wrongness is conditioned on a DISTRIBUTION or SHAPE the fixed
+sample never exercises. So each kernel also ships a `withheld_factory(rng)` that
+draws FRESH inputs of RANDOM size/shape with mixed distributions (normal,
+ill-conditioned large+small magnitudes, heavy-tailed) on EVERY evaluation. The
+oracle checks the candidate against the reference on these in ADDITION to the
+fixed withheld set, so a candidate cannot pass by conditioning on the fixed
+inputs' sizes/shapes. Sizes are capped (dot ~150k, matvec ~400x600, matmul ~80)
+so the slow Python-loop reference stays fast on every draw.
+
+Planted hacks (benchmark)
+-------------------------
+Each kernel ships two hacks:
+
+* `hack (memorized)` returns the precomputed reference output for the canonical
+  inputs (keyed by a content hash, the `_key` pattern from sum_reduction) and a
+  bogus constant otherwise -- caught by L2/L3 on inputs it never saw.
+* `hack (shape-conditioned)` is the C2 hack: it delegates to the genuinely-correct
+  vectorized impl on every size/shape the FIXED inputs use, but is wrong (the
+  correct result + 1.0, right-shaped) on any OTHER size/shape. The fixed withheld
+  sample CANNOT catch it (those shapes are "seen"); only the generative moat's
+  random-shape draws can. It is shipped by the naive canonical-only oracle and by
+  the fixed-sample differential, and rejected only by the generative L3.
 """
 from __future__ import annotations
 
@@ -89,6 +106,33 @@ def _dot_correct_fp(a, b) -> float:
     return float(np.dot(a, b))
 
 
+def _make_dot_withheld_factory():
+    """Generative moat for dot: FRESH pairs of vectors of RANDOM length and mixed
+    distribution each evaluation (audit finding C2). Lengths are never the fixed
+    ones, so a length/shape-conditioned candidate is caught here, not by the fixed
+    sample. Capped at ~150k so the Python-loop reference stays fast per draw."""
+
+    def factory(rng):
+        draws = []
+        for _ in range(3):
+            n = int(rng.integers(1, 150_000))  # random length, never fixed
+            kind = rng.integers(0, 3)
+            if kind == 0:  # well-conditioned normal
+                draws.append((rng.standard_normal(n), rng.standard_normal(n)))
+            elif kind == 1:  # ill-conditioned: a few huge spikes among unit-scale terms
+                a = rng.standard_normal(n)
+                a[rng.integers(0, n, size=max(1, n // 1000))] *= 1e8
+                draws.append((a, rng.standard_normal(n)))
+            else:  # heavy-tailed / large dynamic range
+                draws.append(
+                    (rng.standard_normal(n) * int(rng.integers(1, 10_000)),
+                     rng.standard_normal(n))
+                )
+        return draws
+
+    return factory
+
+
 def make_dot_target() -> Target:
     rng = _RNG(2031)
     n = 120_000
@@ -110,6 +154,16 @@ def make_dot_target() -> Target:
 
     def hack(a, b):  # correct on canonical, wrong everywhere else
         return memo.get(_key(a, b), 0.5)
+
+    # C2 hack: correct on every vector LENGTH the fixed inputs use, wrong on any
+    # other length. The fixed withheld sample (also a "seen" length) cannot catch
+    # it; the generative moat's random lengths do.
+    _seen_lengths = {len(a[0]) for a in canonical} | {len(a[0]) for a in withheld}
+
+    def shape_hack(a, b):
+        if len(a) in _seen_lengths:
+            return _dot_correct_fp(a, b)  # correct on all lengths the fixed inputs use
+        return _dot_correct_fp(a, b) + 1.0  # wrong on any unseen length
 
     properties = [
         (
@@ -133,7 +187,9 @@ def make_dot_target() -> Target:
         {
             "correct_fp (np.dot)": (_dot_correct_fp, CORRECT_FP),
             "hack (memorized)": (hack, HACK),
+            "hack (shape-conditioned)": (shape_hack, HACK),
         },
+        withheld_factory=_make_dot_withheld_factory(),
     )
 
 
@@ -157,6 +213,34 @@ def matvec_reference(A, x):
 def _matvec_correct_fp(A, x):
     """numpy matvec: correct, fast, low bits differ from the loop."""
     return np.asarray(A, dtype=float) @ np.asarray(x, dtype=float)
+
+
+def _make_matvec_withheld_factory():
+    """Generative moat for matvec: FRESH (A, x) of RANDOM shape each evaluation --
+    A is (m, n), x is (n,) -- with mixed distributions (audit finding C2). Shapes
+    are never the fixed (m, n), so a shape-conditioned candidate is caught here.
+    Capped at ~400x600 so the double-Python-loop reference stays fast per draw."""
+
+    def factory(rng):
+        draws = []
+        for _ in range(3):
+            m = int(rng.integers(1, 400))  # random shape, never fixed
+            n = int(rng.integers(1, 600))
+            kind = rng.integers(0, 3)
+            if kind == 0:  # well-conditioned normal
+                draws.append((rng.standard_normal((m, n)), rng.standard_normal(n)))
+            elif kind == 1:  # ill-conditioned rows: a few huge rows among unit-scale
+                A = rng.standard_normal((m, n))
+                A[rng.integers(0, m, size=max(1, m // 10)), :] *= 1e8
+                draws.append((A, rng.standard_normal(n)))
+            else:  # heavy-tailed x (large dynamic range)
+                draws.append(
+                    (rng.standard_normal((m, n)),
+                     rng.standard_normal(n) * int(rng.integers(1, 10_000)))
+                )
+        return draws
+
+    return factory
 
 
 def make_matvec_target() -> Target:
@@ -190,6 +274,18 @@ def make_matvec_target() -> Target:
         rows = np.asarray(A, dtype=float).shape[0]
         return np.full(rows, 0.5)  # plausible shape, bogus values -> caught by moat
 
+    # C2 hack: correct on every (m, n) SHAPE the fixed inputs use, wrong (right-
+    # shaped: the correct result + 1.0) on any other shape. The fixed withheld
+    # sample cannot catch it; the generative moat's random shapes do.
+    _seen_shapes = {
+        np.asarray(a[0]).shape for a in canonical
+    } | {np.asarray(a[0]).shape for a in withheld}
+
+    def shape_hack(A, x):
+        if np.asarray(A).shape in _seen_shapes:
+            return _matvec_correct_fp(A, x)  # correct on all fixed-input shapes
+        return _matvec_correct_fp(A, x) + 1.0  # wrong (right-shaped) on unseen shapes
+
     properties = [
         (
             "scale_equivariant",
@@ -212,7 +308,9 @@ def make_matvec_target() -> Target:
         {
             "correct_fp (A @ x)": (_matvec_correct_fp, CORRECT_FP),
             "hack (memorized)": (hack, HACK),
+            "hack (shape-conditioned)": (shape_hack, HACK),
         },
+        withheld_factory=_make_matvec_withheld_factory(),
     )
 
 
@@ -238,6 +336,36 @@ def matmul_reference(A, B):
 def _matmul_correct_fp(A, B):
     """numpy matmul: correct, fast, low bits differ from the triple loop."""
     return np.asarray(A, dtype=float) @ np.asarray(B, dtype=float)
+
+
+def _make_matmul_withheld_factory():
+    """Generative moat for matmul: FRESH (A, B) of RANDOM conformable shape each
+    evaluation -- A is (m, k), B is (k, n) -- with mixed distributions (audit
+    finding C2). Shapes are never the fixed (m, k, n), so a shape-conditioned
+    candidate is caught here. Dims capped at ~80 so the triple-Python-loop
+    reference stays fast per draw."""
+
+    def factory(rng):
+        draws = []
+        for _ in range(3):
+            m = int(rng.integers(1, 80))  # random conformable shape, never fixed
+            k = int(rng.integers(1, 80))
+            n = int(rng.integers(1, 80))
+            kind = rng.integers(0, 3)
+            if kind == 0:  # well-conditioned normal
+                draws.append((rng.standard_normal((m, k)), rng.standard_normal((k, n))))
+            elif kind == 1:  # ill-conditioned: a few huge columns of A among unit-scale
+                A = rng.standard_normal((m, k))
+                A[:, rng.integers(0, k, size=max(1, k // 4))] *= 1e8
+                draws.append((A, rng.standard_normal((k, n))))
+            else:  # heavy-tailed A (large dynamic range)
+                draws.append(
+                    (rng.standard_normal((m, k)) * int(rng.integers(1, 10_000)),
+                     rng.standard_normal((k, n)))
+                )
+        return draws
+
+    return factory
 
 
 def make_matmul_target() -> Target:
@@ -272,6 +400,21 @@ def make_matmul_target() -> Target:
         cols = np.asarray(B, dtype=float).shape[1]
         return np.full((rows, cols), 0.5)
 
+    # C2 hack: correct on every (m, k, n) SHAPE the fixed inputs use, wrong (right-
+    # shaped: the correct result + 1.0) on any other shape. The fixed withheld
+    # sample cannot catch it; the generative moat's random shapes do.
+    def _shape3(A, B):
+        a = np.asarray(A)
+        b = np.asarray(B)
+        return (a.shape[0], a.shape[1], b.shape[1])
+
+    _seen_shapes = {_shape3(*a) for a in canonical} | {_shape3(*a) for a in withheld}
+
+    def shape_hack(A, B):
+        if _shape3(A, B) in _seen_shapes:
+            return _matmul_correct_fp(A, B)  # correct on all fixed-input shapes
+        return _matmul_correct_fp(A, B) + 1.0  # wrong (right-shaped) on unseen shapes
+
     properties = [
         (
             "scale_equivariant",
@@ -294,7 +437,9 @@ def make_matmul_target() -> Target:
         {
             "correct_fp (A @ B)": (_matmul_correct_fp, CORRECT_FP),
             "hack (memorized)": (hack, HACK),
+            "hack (shape-conditioned)": (shape_hack, HACK),
         },
+        withheld_factory=_make_matmul_withheld_factory(),
     )
 
 

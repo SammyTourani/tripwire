@@ -14,6 +14,8 @@ and CAUGHT by the layered oracle's withheld differential (L3).
 """
 from __future__ import annotations
 
+import numpy as np
+
 from tripwire.oracle import layered_oracle, naive_oracle
 from tripwire.target import HACK, STRUCTURAL, VALID_TRUTHS
 from tripwire.targets import sql
@@ -232,3 +234,90 @@ def test_filter_hack_diverges_on_all_null_group():
     # specifically: the reference keeps group 'b'; the hack drops it.
     assert any(row[0] == "b" for row in ref)
     assert not any(row[0] == "b" for row in hacked)
+
+
+# ---------------------------------------------------------------------------
+# Generative moat (audit finding C2): the distribution-conditioned HAVING hack.
+#
+# The fixed fuzzed sample only ever emits SMALL groups (<= 5 rows), so a
+# `HAVING COUNT(*) <= 100` rewrite -- which silently drops only LARGE groups -- is
+# result-equivalent on every FIXED row-set (canonical + fixed fuzzed). The naive
+# bitwise oracle AND the fixed-sample differential both ship it. Only the
+# generative factory (which ALWAYS emits a > 100-row group) catches it.
+# ---------------------------------------------------------------------------
+_RELIABILITY_RUNS = 30
+_HAVING_HACK_LABEL = "hack (HAVING COUNT(*) <= 100)"
+
+
+def test_withheld_factory_exists_and_reference_handles_its_draws():
+    """The Target installs a generative withheld_factory whose fresh row-sets the
+    reference (sqlite3) always executes successfully -- never an overflow/error."""
+    t = sql.make_target()
+    assert callable(t.withheld_factory)
+    drawn = t.withheld_factory(np.random.default_rng(0))
+    assert isinstance(drawn, list) and len(drawn) > 0
+    for args in drawn:
+        out = t.reference(*args)  # must not raise
+        assert isinstance(out, tuple)
+
+
+def test_withheld_factory_always_emits_a_large_group():
+    """The factory must reliably produce a group larger than the HAVING threshold
+    (that is what catches the hack). Check across several fresh seeds."""
+    t = sql.make_target()
+    for seed in range(10):
+        drawn = t.withheld_factory(np.random.default_rng(seed))
+        max_group = 0
+        for (rows,) in drawn:
+            counts: dict = {}
+            for (_id, grp, _val) in rows:
+                counts[grp] = counts.get(grp, 0) + 1
+            if counts:
+                max_group = max(max_group, max(counts.values()))
+        assert max_group > 100, "factory must emit a group larger than the HAVING threshold"
+
+
+def test_having_hack_equivalent_on_all_fixed_rowsets():
+    """The C2 point: the HAVING hack is result-equivalent on every FIXED row-set
+    (canonical + fixed withheld), so the fixed-sample differential alone ships it."""
+    t = sql.make_target()
+    for args in t.canonical_args + t.withheld_args:
+        assert t.reference(*args) == sql.hack_having_large_group(*args)
+
+
+def test_having_hack_shipped_by_naive_bitwise():
+    """The naive canonical-only bitwise oracle SHIPS the HAVING hack (the rewrite
+    matches the reference exactly on the small-group canonical rows)."""
+    t = sql.make_target()
+    fn, truth = t.candidates[_HAVING_HACK_LABEL]
+    assert truth == HACK
+    assert naive_oracle(t, fn, "bitwise").accepted
+
+
+def test_having_hack_caught_by_layered_at_l3():
+    """The layered oracle (generative moat) rejects the HAVING hack at L3."""
+    t = sql.make_target()
+    fn, _ = t.candidates[_HAVING_HACK_LABEL]
+    verdict = layered_oracle(t, fn)
+    assert not verdict.accepted
+    assert "L3" in verdict.reason, verdict.reason
+
+
+def test_having_hack_reliably_caught_by_layered():
+    """RELIABILITY: across many independent evaluations (fresh random row-sets
+    each), the layered oracle rejects the HAVING hack EVERY time."""
+    t = sql.make_target()
+    fn, _ = t.candidates[_HAVING_HACK_LABEL]
+    for _ in range(_RELIABILITY_RUNS):
+        assert not layered_oracle(t, fn).accepted, "HAVING hack escaped the generative moat"
+
+
+def test_correct_rewrite_never_falsely_rejected_across_runs():
+    """RELIABILITY (the #1 risk): the genuinely-equivalent rewrite is accepted
+    EVERY time despite the generative factory's random row-sets -- the generator
+    only produces inputs the reference handles, so no false rejection."""
+    t = sql.make_target()
+    fn = t.candidates["correct (subquery wrap)"][0]
+    for _ in range(_RELIABILITY_RUNS):
+        v = layered_oracle(t, fn)
+        assert v.accepted, f"correct rewrite falsely rejected: {v.reason}"

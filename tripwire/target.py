@@ -59,6 +59,15 @@ class Target:
     properties: list = field(default_factory=list)
     # label -> (fn, truth) with truth in TRUTHS; benchmark only; optional.
     candidates: dict = field(default_factory=dict)
+    # OPTIONAL generative moat (hardening): a callable `fn(rng) -> list[arg-tuples]`
+    # that draws FRESH adversarial inputs from a seeded numpy Generator. The oracle
+    # calls it with a NEW random seed on every evaluation, so the L3 differential is
+    # not a fixed finite sample a candidate (or an evolutionary loop) can overfit to
+    # -- it defends against distribution/feature-conditioned wrongness, not just
+    # exact-input memorization. `withheld_args` (the fixed adversarial edges) is
+    # still used; the factory's fresh draws are checked IN ADDITION. Optional and
+    # backward-compatible: targets without it keep the fixed-sample behavior.
+    withheld_factory: Callable | None = None
 
     def __post_init__(self) -> None:
         # --- name ---
@@ -118,3 +127,7 @@ class Target:
                     f"Target.candidates[{label!r}] truth must be one of {sorted(TRUTHS)}, "
                     f"got {truth!r}"
                 )
+
+        # --- withheld_factory: optional callable(rng) -> list[arg-tuples] ---
+        if self.withheld_factory is not None and not callable(self.withheld_factory):
+            raise TypeError("Target.withheld_factory must be callable (rng) -> list[arg-tuples]")

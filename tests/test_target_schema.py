@@ -75,13 +75,18 @@ def test_field_names_and_order_frozen():
         "withheld_args",
         "properties",
         "candidates",
-    ], "Interface A field set/order changed -- this is a FROZEN contract (1.3)"
+        # ADDITIVE (hardening): optional generative moat. Appended LAST so the
+        # original 7-field positional construction is unchanged. New optional fields
+        # may be appended here, but the first 7 names/order are FROZEN.
+        "withheld_factory",
+    ], "Interface A field set/order changed -- the first 7 are FROZEN (1.3)"
 
 
 def test_optional_fields_have_safe_defaults():
     t = _ok()
     assert t.properties == []
     assert t.candidates == {}
+    assert t.withheld_factory is None  # optional generative moat; off by default
     # defaults must be independent instances (no shared mutable default state)
     t2 = _ok()
     t.properties.append(("x", lambda a, o: True))

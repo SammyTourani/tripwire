@@ -46,6 +46,24 @@ boundary integers -- with sqlite3 as ground truth. A rewrite that is "equivalent
 on the tame canonical rows but mishandles NULL/duplicate/empty-group semantics is
 caught here.
 
+The generative moat (L3, audit finding C2)
+-------------------------------------------
+The fixed fuzzed ``withheld_args`` are a finite, enumerable sample, so they only
+catch wrongness keyed on features that sample happens to exercise. The fixed
+fuzzer emits only SMALL groups (<= 5 rows) and only BOUNDARY integer values --
+never, say, ``val=42`` or a group of 100+ rows. A rewrite whose wrongness is
+conditioned on *those unseen distribution features* (e.g. ``HAVING COUNT(*) <=
+100`` -- which silently drops only LARGE groups) is result-equivalent on every
+fixed row-set and sails through. So the Target also ships a ``withheld_factory``
+that, on EVERY evaluation, generates FRESH adversarial row-sets the fixed sample
+never pins: it ALWAYS includes a row-set with a LARGE group (> 100 rows under one
+key), plus row-sets with values drawn across a WIDE integer range (including
+``42``), random NULL densities, and a random number of rows/groups. SUM/AVG are
+still avoided so COUNT/MIN/MAX over INTEGER are always exact and never overflow --
+the reference stays valid on every draw. The oracle checks these in ADDITION to
+the fixed set under fresh random seeds, so the moat now defends
+distribution-conditioned wrongness, not just exact-input memorization.
+
 Metamorphic property (L2)
 -------------------------
 ``grouped_result_well_formed``: every result row has the reference query's arity
@@ -61,9 +79,15 @@ Planted hacks (benchmark)
 2. ``hack: WHERE val IS NOT NULL`` -- a "push down a filter" rewrite that also
    silently drops NULL rows (changing ``COUNT(*)``) and can drop an entire group.
    Caught by the same NULL-bearing row-sets.
+3. ``hack: HAVING COUNT(*) <= 100`` -- the C2 (distribution-conditioned) hack. It
+   silently drops any group with more than 100 rows. The fixed canonical and fixed
+   fuzzed row-sets only ever have small groups, so it is result-equivalent on ALL
+   of them (the naive oracle AND the fixed-sample differential both ship it). Only
+   the generative moat -- which always emits a large group -- catches it.
 
-The layered oracle must REJECT both (L3); ``naive_oracle(..., "bitwise")`` ships
-both, because on canonical data they match -- the thesis in SQL form (CLAUDE.md §2).
+The layered oracle must REJECT all three (L3); ``naive_oracle(..., "bitwise")``
+ships them, because on canonical data they match -- the thesis in SQL form
+(CLAUDE.md §2).
 
 Everything is stdlib-only and deterministic given the fuzzer seed; no network
 (CLAUDE.md §7).
@@ -111,6 +135,19 @@ HACK_FILTER_QUERY = (
     "FROM t WHERE val IS NOT NULL GROUP BY grp"
 )
 
+# Hack 3 (audit finding C2): a HAVING filter that silently drops only LARGE groups.
+# Result-equivalent on every fixed row-set (canonical + fuzzed groups are all <= 5
+# rows), so the naive oracle and the fixed-sample differential both ship it. Only
+# the generative moat (which always emits a > 100-row group) catches it.
+HACK_HAVING_LARGE_GROUP_QUERY = (
+    "SELECT grp, COUNT(*), COUNT(val), MIN(val), MAX(val) "
+    "FROM t GROUP BY grp HAVING COUNT(*) <= 100"
+)
+
+# The largest group the GENERATIVE factory must reliably exceed so the HAVING hack
+# above is always caught. Kept comfortably above any fixed-sample group size.
+_HAVING_HACK_THRESHOLD = 100
+
 
 # ---------------------------------------------------------------------------
 # Reference + candidate functions. Each runs its query and returns the
@@ -138,6 +175,79 @@ def hack_filter(rows) -> tuple:
     """HACK: WHERE val IS NOT NULL. Drops NULL rows (and all-NULL groups), changing
     COUNT(*); correct only on data with no NULL ``val``."""
     return execute(HACK_FILTER_QUERY, SCHEMA, rows)
+
+
+def hack_having_large_group(rows) -> tuple:
+    """HACK (C2): HAVING COUNT(*) <= 100. Drops any group with more than 100 rows.
+    Result-equivalent on every fixed row-set (all small groups), so naive ships it;
+    only the generative moat's always-present large group catches it."""
+    return execute(HACK_HAVING_LARGE_GROUP_QUERY, SCHEMA, rows)
+
+
+# ---------------------------------------------------------------------------
+# Generative moat (audit finding C2): fresh adversarial row-sets per evaluation.
+# ---------------------------------------------------------------------------
+# A WIDE integer range COUNT/MIN/MAX handle exactly (no SUM/AVG -> no overflow), so
+# the reference stays valid on every draw while still spanning values the fixed
+# fuzzer never emits (the fixed fuzzer uses only boundary integers, never e.g. 42).
+_WIDE_VAL_LO = -2_000_000_000
+_WIDE_VAL_HI = 2_000_000_000
+# A specific value some hacks key on (the fixed fuzzer never emits it); the factory
+# draws it sometimes so a `WHERE val <> 42`-style hack would also be caught.
+_KEYED_VALUE = 42
+
+
+def _rand_val(rng):
+    """A single ``val`` cell: NULL sometimes, the keyed value sometimes, else a
+    value drawn across the wide integer range. All are valid for COUNT/MIN/MAX."""
+    r = rng.random()
+    if r < 0.15:
+        return None
+    if r < 0.25:
+        return _KEYED_VALUE
+    return int(rng.integers(_WIDE_VAL_LO, _WIDE_VAL_HI))
+
+
+def _make_withheld_factory():
+    """Generative moat: ``factory(rng)`` returns FRESH adversarial row-sets each
+    evaluation (rng is a numpy Generator). It pins distribution features the fixed
+    fuzzed sample never does -- crucially a LARGE group (> 100 rows under one key),
+    which deterministically catches a ``HAVING COUNT(*) <= 100`` hack the fixed
+    small-group sample cannot. Stdlib-only, deterministic given ``rng``, no network.
+
+    Every call yields several ``(rows,)`` tuples:
+      1. a LARGE-group set: one key with > _HAVING_HACK_THRESHOLD rows (+ a few
+         small groups), so a large-group-dropping hack always diverges here;
+      2. a WIDE-VALUE set: a random number of small groups with values across the
+         wide range (incl. ``42``) and random NULL density;
+      3. a RANDOM-SIZE set: a handful of rows over a few keys (broad coverage)."""
+
+    def factory(rng):
+        sets: list = []
+
+        # 1. ALWAYS a large group (> threshold rows) -> catches the HAVING hack.
+        big_n = int(rng.integers(_HAVING_HACK_THRESHOLD + 50, _HAVING_HACK_THRESHOLD + 300))
+        big = [(i, "BIG", _rand_val(rng)) for i in range(big_n)]
+        for j in range(int(rng.integers(0, 4))):  # a few small groups alongside it
+            big.append((big_n + j, f"small{j}", _rand_val(rng)))
+        sets.append(big)
+
+        # 2. wide-value set: random count of small groups, wide values, random NULLs.
+        rows: list = []
+        rid = 0
+        for g in range(int(rng.integers(1, 8))):
+            for _ in range(int(rng.integers(1, 6))):
+                rows.append((rid, f"g{g}", _rand_val(rng)))
+                rid += 1
+        sets.append(rows)
+
+        # 3. a random-size set over a few keys.
+        m = int(rng.integers(0, 50))
+        sets.append([(i, f"k{int(rng.integers(0, 5))}", _rand_val(rng)) for i in range(m)])
+
+        return [(s,) for s in sets]
+
+    return factory
 
 
 # ---------------------------------------------------------------------------
@@ -184,5 +294,7 @@ def make_target() -> Target:
             "correct (subquery wrap)": (correct, CORRECT),
             "hack (COUNT(*) -> COUNT(val))": (hack_count, HACK),
             "hack (WHERE val IS NOT NULL)": (hack_filter, HACK),
+            "hack (HAVING COUNT(*) <= 100)": (hack_having_large_group, HACK),
         },
+        withheld_factory=_make_withheld_factory(),
     )
