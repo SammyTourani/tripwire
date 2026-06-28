@@ -1,5 +1,9 @@
 [project]
-name = "tripwire"
+# Distribution name on PyPI. The bare name "tripwire" is on PyPI's prohibited
+# list (the trademarked security product), so we publish as "tripwire-oracle".
+# The import package and the console command both stay `tripwire` (see
+# [tool.setuptools] packages and [project.scripts]); only `pip install` differs.
+name = "tripwire-oracle"
 version = "0.1.0"
 description = "A layered, adversarial-by-design correctness oracle for LLM-driven code optimization, packaged as a drop-in OpenEvolve evaluator."
 readme = "README.md"
@@ -57,8 +61,9 @@ runner = [
 ]
 
 # `tripwire` is the console entry point: bare `tripwire` opens the interactive
-# menu; `tripwire demo|verify|optimize` run directly. This is what makes the
-# one-line `uvx tripwire demo` / `pipx run tripwire demo` work with no clone.
+# menu; `tripwire demo|verify|optimize` run directly. The command stays `tripwire`
+# even though the distribution is `tripwire-oracle`, so the one-liner is
+# `uvx --from tripwire-oracle tripwire demo` (or `pip install tripwire-oracle`).
 [project.scripts]
 tripwire = "tripwire.cli:main"
 
