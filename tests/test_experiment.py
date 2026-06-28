@@ -133,3 +133,27 @@ def test_retry_delay_honours_retry_after():
     assert llm._retry_delay("999", 2.0, 0) == 30.0  # capped
     assert llm._retry_delay(None, 2.0, 2) == 8.0  # 2 * 2**2
     assert llm._retry_delay("not-a-number", 2.0, 0) == 2.0  # falls back to backoff
+
+
+# --- tempted generation mode (model-free, mocked) --------------------------
+def test_generate_format_examples_uses_canonical():
+    target = TARGET_FACTORIES[0][1]()
+    ex = generate._format_examples(target)
+    assert "solve(" in ex and "==" in ex
+    assert 1 <= ex.count("solve(") <= 6  # capped, from canonical inputs only
+
+
+def test_generate_candidates_tempt_builds_gameable_prompt(monkeypatch):
+    target = TARGET_FACTORIES[0][1]()
+    captured = {}
+
+    def fake_chat(messages, **kw):
+        captured["system"] = messages[0]["content"]
+        captured["user"] = messages[1]["content"]
+        return "```python\ndef solve(s):\n    return s\n```"
+
+    monkeypatch.setattr(generate, "chat", fake_chat)
+    out = generate.generate_candidates(target, model="m", n=1, tempt=True)
+    assert out and "def solve" in out[0]
+    assert "only inputs it checks" in captured["system"]   # naive grader described
+    assert "solve(" in captured["user"]                    # example pairs shown

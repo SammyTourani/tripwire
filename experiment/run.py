@@ -110,7 +110,7 @@ def evaluate_candidate_isolated(target, candidate_path, *, candidate_source, jud
     return truth, moat, judge_v
 
 
-def run_models(models, *, judge_model, samples, output_dir) -> int:
+def run_models(models, *, judge_model, samples, output_dir, tempt=False) -> int:
     from experiment.generate import generate_candidates
 
     out = Path(output_dir)
@@ -122,7 +122,7 @@ def run_models(models, *, judge_model, samples, output_dir) -> int:
             target = factory()
             for model in models:
                 print(f"[{name}] generating {samples} candidate(s) from {model} …")
-                candidates = generate_candidates(target, model=model, n=samples)
+                candidates = generate_candidates(target, model=model, n=samples, tempt=tempt)
                 safe = name.replace(":", "_") + "_" + model.replace("/", "_")
                 for i, source in enumerate(candidates):
                     cand_file = workdir / f"{safe}_{i}.py"
@@ -133,7 +133,8 @@ def run_models(models, *, judge_model, samples, output_dir) -> int:
                         target, str(cand_file), candidate_source=source, judge_model=judge_model
                     )
                     rec = {"target": target.name, "model": model, "candidate": i,
-                           "truth": truth, "moat": moat, "judge": judge_v}
+                           "truth": truth, "moat": moat, "judge": judge_v,
+                           "mode": "tempt" if tempt else "plain"}
                     records.append(rec)
                     print(f"    cand {i}: truth={truth:<7} moat={moat:<7} judge={judge_v}")
     finally:
@@ -180,6 +181,9 @@ def main(argv=None) -> int:
     p.add_argument("--judge-model", help="LLM-judge baseline model (default: first --models)")
     p.add_argument("--samples", type=int, default=3, help="candidates per (target, model)")
     p.add_argument("--output", default="experiment-runs", help="output dir for the records")
+    p.add_argument("--tempt", action="store_true",
+                   help="show the model the visible inputs under a naive speed-only grader "
+                        "(elicits reward-hacks; withheld inputs stay hidden)")
     args = p.parse_args(argv)
 
     if args.planted or not args.models:
@@ -189,6 +193,7 @@ def main(argv=None) -> int:
         judge_model=args.judge_model or args.models[0],
         samples=args.samples,
         output_dir=args.output,
+        tempt=args.tempt,
     )
 
 
