@@ -5,8 +5,10 @@
 subcommands, for scripts and power users:
 
     tripwire demo                       run the cross-domain integrity scorecard
-    tripwire verify TARGET CANDIDATE    verify one optimized candidate
-    tripwire optimize TARGET            run a real OpenEvolve loop (needs extras)
+    tripwire verify TARGET CANDIDATE    verify one optimized candidate (--example to try one)
+    tripwire optimize TARGET            run a real OpenEvolve loop (--example to try one)
+    tripwire init REFERENCE.py          scaffold a Target from your function
+    tripwire explain                    how it works (the 4-layer oracle)
 
 The heavy lifting lives in the packaged modules (tripwire.scorecard, the oracle,
 the evaluator). This file is presentation + dispatch only -- no oracle logic and
@@ -33,8 +35,11 @@ TAGLINE = "adversarial correctness oracle for AI code optimization"
 # Interactive menu: (action key, label, one-line description).
 MENU = [
     ("demo", "Run the demo", "watch the oracle catch planted reward-hacks"),
+    ("example", "Try an example", "verify a real win and a planted hack (no setup)"),
     ("verify", "Verify my code", "check a candidate against a reference target"),
+    ("init", "Scaffold a target", "generate a Target skeleton from your function"),
     ("optimize", "Optimize a target", "run the full evolutionary loop (needs API key)"),
+    ("explain", "How it works", "the 4-layer oracle, Targets, and the commands"),
     ("quit", "Quit", ""),
 ]
 
@@ -341,6 +346,10 @@ def run_demo(console, *, banner=True):
 
     console.print()
     console.print(_summary_panel(summarize(rows), rows))
+    console.print(
+        "\n  [dim]next: `tripwire verify --example` to watch it check a real candidate, "
+        "or `tripwire init <your_ref.py>` to start on your own code.[/dim]"
+    )
     return 0
 
 
@@ -574,8 +583,78 @@ def _optimize_prereq_panel(console, have_oe, have_key, have_model, target_path):
     return 2
 
 
+def _ensure_openevolve(console, *, assume_yes=False):
+    """Return True if OpenEvolve is importable -- installing it on consent if not.
+
+    Default is detect-and-OFFER (a [Y/n] prompt), not silent install: a tool that
+    quietly mutates your environment is a footgun. --yes / TRIPWIRE_AUTO_INSTALL skip
+    the prompt; a non-interactive shell prints the command instead of guessing."""
+    import importlib
+
+    try:
+        importlib.import_module("openevolve")
+        return True
+    except Exception:
+        pass
+
+    spec = "openevolve>=0.2.27"
+    env_auto = os.environ.get("TRIPWIRE_AUTO_INSTALL", "").strip().lower() in ("1", "true", "yes")
+    auto = assume_yes or env_auto
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+
+    if not auto:
+        if not interactive:
+            console.print("  [red]OpenEvolve is required for optimize and isn't installed.[/red]")
+            console.print(f'  install it:  {sys.executable} -m pip install "{spec}"', style=MUTE)
+            console.print("  or run:      pip install 'tripwire-oracle[runner]'", style=MUTE)
+            return False
+        try:
+            ans = (
+                console.input(
+                    f"  OpenEvolve isn't installed. Install {spec} into this environment "
+                    "now? [Y/n] "
+                )
+                .strip()
+                .lower()
+            )
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return False
+        if ans not in ("", "y", "yes"):
+            console.print(
+                "  [dim]skipped — install it yourself with "
+                "pip install 'tripwire-oracle[runner]'.[/dim]"
+            )
+            return False
+
+    console.print(f"  [dim]installing {spec} …[/dim]")
+    import subprocess
+
+    rc = subprocess.call([sys.executable, "-m", "pip", "install", spec])
+    if rc != 0:
+        console.print(
+            f"  [red]install failed (exit {rc}).[/red] Try: pip install 'tripwire-oracle[runner]'"
+        )
+        return False
+    importlib.invalidate_caches()
+    try:
+        importlib.import_module("openevolve")
+        console.print("  [green]OpenEvolve installed.[/green]")
+        return True
+    except Exception:
+        console.print("  [red]OpenEvolve still not importable after install.[/red]")
+        return False
+
+
 def run_optimize(
-    console, target_path=None, *, iterations=None, initial_path=None, output_dir=None, env=None
+    console,
+    target_path=None,
+    *,
+    iterations=None,
+    initial_path=None,
+    output_dir=None,
+    env=None,
+    assume_yes=False,
 ):
     from rich.console import Group
     from rich.panel import Panel
@@ -590,8 +669,11 @@ def run_optimize(
     # `env` lets the interactive menu prepare the environment once and pass the result
     # in (avoids a second .env notice); otherwise prepare it here.
     have_oe, have_key, have_model = env if env is not None else _prepare_optimize_env(console)
-    if not (have_oe and have_key and have_model and target_path):
+    if not (have_key and have_model and target_path):
         return _optimize_prereq_panel(console, have_oe, have_key, have_model, target_path)
+    # Have a target + credentials but OpenEvolve missing -> offer to install it.
+    if not have_oe and not _ensure_openevolve(console, assume_yes=assume_yes):
+        return _optimize_prereq_panel(console, False, have_key, have_model, target_path)
 
     target = _load_target(console, target_path)
     if target is None:
@@ -668,11 +750,167 @@ def run_optimize(
 
 
 # --------------------------------------------------------------------------- #
+# example / init / explain
+# --------------------------------------------------------------------------- #
+def run_verify_example(console):
+    """Verify the bundled example: a real win (ACCEPTED) and a planted hack (REJECTED).
+    Fully offline -- the instant 'what verify does' experience."""
+    from tripwire import examples as ex
+
+    console.print()
+    console.print(
+        "  [bold]verify --example[/bold] — the oracle on a real optimization and a "
+        "planted hack\n",
+        style="#f5f5f5",
+    )
+    console.print("  [dim]1/2  a correct, faster candidate → expected: ACCEPTED[/dim]")
+    rc_good = run_verify(console, str(ex.TARGET), str(ex.FAST_CANDIDATE))
+    console.print(
+        "\n  [dim]2/2  a memorized hack (correct on seen inputs only) → expected: "
+        "REJECTED[/dim]"
+    )
+    rc_hack = run_verify(console, str(ex.TARGET), str(ex.HACK_CANDIDATE))
+    console.print(
+        "\n  [dim]that's the moat: the hack passed the visible inputs but was caught on "
+        "inputs it never saw. Run `tripwire init <your_ref.py>` to do this on your code.[/dim]"
+    )
+    return 0 if (rc_good == 0 and rc_hack == 1) else 1
+
+
+def run_init(console, ref_path, *, function=None, output=None, force=False):
+    from pathlib import Path
+
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.text import Text
+
+    from tripwire.scaffold import ScaffoldError, scaffold_target
+
+    try:
+        code = scaffold_target(ref_path, function)
+    except ScaffoldError as e:
+        console.print(f"  [red]{e}[/red]")
+        return 1
+
+    if output == "-":
+        # Write verbatim, NOT via rich -- console.print would interpret `[int]` type
+        # hints as markup and hard-wrap long lines, corrupting the emitted Python.
+        sys.stdout.write(code if code.endswith("\n") else code + "\n")
+        return 0
+
+    out = Path(output) if output else Path(ref_path).with_name(Path(ref_path).stem + "_target.py")
+    if out.exists() and not force:
+        console.print(f"  [red]{out} already exists[/red] (use --force to overwrite)")
+        return 1
+    out.write_text(code)
+
+    body = Group(
+        Text(f"wrote {out}", style="bold green"),
+        Text(),
+        Text("next:", style="bold #f5f5f5"),
+        Text(f"  1. open {out} and fill in canonical_args / withheld_args (the TODOs)",
+             style="#f5f5f5"),
+        Text(f"  2. tripwire verify {out} <your_candidate.py>", style=f"bold {RED}"),
+        Text(f"     tripwire optimize {out}", style=f"bold {RED}"),
+        Text(),
+        Text("the withheld inputs are the moat — make them adversarial, not more-of-the-same.",
+             style=MUTE),
+        Text("if your reference calls helpers or uses conditional imports from the original "
+             "file, paste those in too.", style=MUTE),
+    )
+    console.print()
+    console.print(
+        Panel(body, title="[bold]init[/bold]", title_align="left", border_style="green",
+              padding=(1, 2))
+    )
+    return 0
+
+
+def run_explain(console):
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.text import Text
+
+    layers = Text()
+    for code, desc in [
+        ("L1", "canonical correctness — exact/tolerance match on the inputs you provide"),
+        ("L2", "metamorphic properties — invariants the real computation must satisfy"),
+        ("L3", "withheld adversarial inputs — THE MOAT: inputs the optimizer never saw"),
+        ("L4", "isolated speedup — measured only after L1–L3 pass"),
+    ]:
+        layers.append(f"  {code}  ", style=f"bold {RED}")
+        layers.append(desc + "\n", style="#f5f5f5")
+
+    body = Group(
+        Text(
+            "AI tools that “optimize” code sometimes cheat: they return code that looks "
+            "much faster but is secretly wrong (it memorized the test answers, or skipped "
+            "the work). Tripwire is the check that catches that.",
+            style="#f5f5f5",
+        ),
+        Text(),
+        Text("the oracle grades every candidate in four layers:", style="bold #f5f5f5"),
+        layers,
+        Text(
+            "Any correctness layer failing ⇒ rejected, zero credit. Speed counts only "
+            "after correctness is proven.",
+            style=MUTE,
+        ),
+        Text(),
+        Text("a Target tells the oracle how to judge your problem:", style="bold #f5f5f5"),
+        Text(
+            "  reference (slow but correct) · canonical inputs · withheld adversarial "
+            "inputs · properties",
+            style="#f5f5f5",
+        ),
+        Text("  write one by hand, or scaffold it with `tripwire init <your_ref.py>`.",
+             style=MUTE),
+        Text(),
+        Text("commands:", style="bold #f5f5f5"),
+        Text("  demo      see it catch planted hacks across domains (no setup)", style="#f5f5f5"),
+        Text("  verify    check your candidate against a target  (--example to try one)",
+             style="#f5f5f5"),
+        Text("  init      scaffold a Target from your reference function", style="#f5f5f5"),
+        Text("  optimize  run a real LLM loop, oracle-graded     (--example to try one)",
+             style="#f5f5f5"),
+        Text(),
+        Text(
+            "quickstart:  tripwire demo  →  tripwire verify --example  →  "
+            "tripwire init your_ref.py  →  tripwire optimize your_ref_target.py",
+            style=f"bold {RED}",
+        ),
+    )
+    console.print()
+    console.print(
+        Panel(body, title="[bold]how tripwire works[/bold]", title_align="left",
+              border_style=RED, padding=(1, 2))
+    )
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # interactive dispatch + entrypoint
 # --------------------------------------------------------------------------- #
 def _dispatch_interactive(console, choice):
     if choice == "demo":
         return run_demo(console, banner=False)
+    if choice == "example":
+        return run_verify_example(console)
+    if choice == "explain":
+        return run_explain(console)
+    if choice == "init":
+        console.print()
+        try:
+            ref = console.input(
+                "  [bold]reference file[/bold] (.py with your slow-but-correct function): "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n  [dim]cancelled.[/dim]")
+            return 0
+        if not ref:
+            console.print("  [red]need a reference file.[/red]")
+            return 1
+        return run_init(console, ref)
     if choice == "verify":
         console.print()
         try:
@@ -737,8 +975,9 @@ def _build_parser():
     sub.add_parser("demo", help="run the cross-domain integrity scorecard")
 
     pv = sub.add_parser("verify", help="verify one optimized candidate against a target")
-    pv.add_argument("target", help="path to a .py exposing `target` or `make_target()`")
-    pv.add_argument("candidate", help="path to the optimized candidate .py")
+    pv.add_argument("target", nargs="?", help="path to a .py exposing `target` or `make_target()`")
+    pv.add_argument("candidate", nargs="?", help="path to the optimized candidate .py")
+    pv.add_argument("--example", action="store_true", help="run a bundled example (no setup)")
     pv.add_argument(
         "--trust",
         action="store_true",
@@ -750,6 +989,7 @@ def _build_parser():
         help="run a real OpenEvolve loop (needs the runner extra + an LLM key)",
     )
     po.add_argument("target", nargs="?", help="path to a .py exposing `target` or `make_target()`")
+    po.add_argument("--example", action="store_true", help="optimize a bundled example target")
     po.add_argument(
         "--iterations", type=int, default=None, help="number of loop iterations (default 10)"
     )
@@ -758,6 +998,19 @@ def _build_parser():
         help="explicit initial program .py (default: derived from the target's reference)",
     )
     po.add_argument("--output", help="output directory (default ./tripwire-runs)")
+    po.add_argument(
+        "--yes", action="store_true", help="auto-install OpenEvolve if missing (no prompt)"
+    )
+
+    pi = sub.add_parser("init", help="scaffold a Target skeleton from a reference .py")
+    pi.add_argument("reference", help="path to a .py with your slow-but-correct function")
+    pi.add_argument("--function", help="which function to use (if the file has several)")
+    pi.add_argument(
+        "-o", "--output", help="output path (default <reference>_target.py; '-' for stdout)"
+    )
+    pi.add_argument("--force", action="store_true", help="overwrite the output file if it exists")
+
+    sub.add_parser("explain", help="how it works (the 4-layer oracle)")
 
     return parser
 
@@ -797,15 +1050,34 @@ def main(argv=None):
 
     if args.command == "demo":
         return run_demo(console)
+    if args.command == "explain":
+        return run_explain(console)
+    if args.command == "init":
+        return run_init(
+            console, args.reference, function=args.function, output=args.output, force=args.force
+        )
     if args.command == "verify":
+        if args.example:
+            return run_verify_example(console)
+        if not (args.target and args.candidate):
+            console.print("  [red]verify needs TARGET and CANDIDATE, or --example.[/red]")
+            return 2
         return run_verify(console, args.target, args.candidate, isolate=not args.trust)
     if args.command == "optimize":
+        target = None
+        if args.example:
+            from tripwire import examples as ex
+
+            target = str(ex.TARGET)
+        elif args.target:
+            target = args.target
         return run_optimize(
             console,
-            args.target,
+            target,
             iterations=args.iterations,
             initial_path=args.initial,
             output_dir=args.output,
+            assume_yes=args.yes,
         )
 
     parser.print_help()

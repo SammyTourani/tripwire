@@ -4,7 +4,7 @@
 # The import package and the console command both stay `tripwire` (see
 # [tool.setuptools] packages and [project.scripts]); only `pip install` differs.
 name = "tripwire-oracle"
-version = "0.2.0"
+version = "0.3.0"
 description = "A layered, adversarial-by-design correctness oracle for LLM-driven code optimization, packaged as a drop-in OpenEvolve evaluator."
 readme = "README.md"
 license = "MIT"
@@ -78,7 +78,7 @@ build-backend = "setuptools.build_meta"
 # cli.py and scorecard.py live inside the `tripwire` package, so they ship
 # automatically with this list -- the demo no longer depends on the unpackaged
 # bench/ directory.
-packages = ["tripwire", "tripwire.targets"]
+packages = ["tripwire", "tripwire.targets", "tripwire.examples"]
 py-modules = ["optimizer_integrity_bench"]
 
 [tool.ruff]

@@ -7,7 +7,7 @@ import {
   animate,
   useInView as useInViewFM,
 } from "framer-motion";
-import { createFileRoute } from "@tanstack/react-router";
+import { Link, createFileRoute } from "@tanstack/react-router";
 import {
   REPO_URL,
   README_URL,
@@ -137,7 +137,13 @@ function Index() {
               </a>
             ))}
           </nav>
-          <div className="ml-auto hidden md:block anim-pop" style={{ animationDelay: "220ms" }}>
+          <div className="ml-auto hidden md:flex items-center gap-5 anim-pop" style={{ animationDelay: "220ms" }}>
+            <Link
+              to="/docs"
+              className="text-[15px] text-neutral-100 opacity-50 hover:opacity-100 transition-opacity"
+            >
+              Docs
+            </Link>
             <a
               href={REPO_URL}
               target="_blank"

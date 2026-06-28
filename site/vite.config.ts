@@ -16,7 +16,9 @@ export default defineConfig({
     tanstackStart({
       prerender: {
         enabled: true,
-        crawlLinks: false,
+        // Follow internal links so the /docs route (linked from the landing page) is
+        // prerendered alongside "/". Only same-origin routes are crawled.
+        crawlLinks: true,
         failOnError: true,
       },
     }),
