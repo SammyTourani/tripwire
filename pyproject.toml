@@ -9,6 +9,11 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "numpy",
+    # The interactive CLI (`tripwire`) is the product's front door, so its two
+    # render deps are core, not optional. Both are pure-Python and light, so the
+    # `uvx tripwire demo` one-liner stays fast. The oracle itself imports neither.
+    "rich>=13",
+    "pyfiglet>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -25,11 +30,20 @@ runner = [
     "openevolve>=0.2.27",
 ]
 
+# `tripwire` is the console entry point: bare `tripwire` opens the interactive
+# menu; `tripwire demo|verify|optimize` run directly. This is what makes the
+# one-line `uvx tripwire demo` / `pipx run tripwire demo` work with no clone.
+[project.scripts]
+tripwire = "tripwire.cli:main"
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
+# cli.py and scorecard.py live inside the `tripwire` package, so they ship
+# automatically with this list -- the demo no longer depends on the unpackaged
+# bench/ directory.
 packages = ["tripwire", "tripwire.targets"]
 py-modules = ["optimizer_integrity_bench"]
 

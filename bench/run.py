@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
-"""bench.run -- the cross-domain Optimizer Integrity Bench scorecard.
+"""bench.run -- the cross-domain Optimizer Integrity Bench scorecard (checkout CLI).
 
 Runs every Tripwire domain Target through all three oracles (naive_bitwise,
 naive_tolerance, layered) and reports, per domain and in aggregate:
   * which candidates each oracle accepts (ships) vs rejects,
   * how many reward-HACKS each oracle ships (the headline integrity number),
   * how many genuinely-valid speedups each oracle KEEPS,
-  * for the layered oracle, a variance-bounded speedup for every kept candidate
-    (Phase 2 task 2.6 -- so no number is a "phantom improvement from noise").
+  * for the layered oracle, a variance-bounded speedup for every kept candidate.
 
-This is the Phase-0 scorecard generalized across all Phase-2 domains. The thesis,
-across every domain: the layered oracle ships 0 hacks AND keeps every real win;
-the naive oracles do not.
-
-Emits:
-  * a human-readable scorecard to stdout,
-  * a JSONL event log at runs/bench-<timestamp>.jsonl (one event per candidate),
-    which the Phase-3 visualizer replays.
+The pure computation (Row, collect_rows, summarize, the domain list) now lives in
+the packaged, side-effect-free `tripwire.scorecard`, so the benchmark and the
+`tripwire` CLI share one source of truth. This module adds the two things specific
+to running the bench from a checkout: a plain-text scorecard on stdout and a JSONL
+event log under runs/ that the Phase-3 visualizer replays.
 
 Run:  python -m bench.run
 """
@@ -25,80 +21,28 @@ from __future__ import annotations
 import json
 import math
 import time
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from tripwire.measure import speedup_stats
-from tripwire.oracle import layered_oracle, naive_oracle
-from tripwire.target import VALID_TRUTHS, Target
-
-# Domain targets to benchmark. Each entry: (display label, factory). The numeric
-# family contributes its three kernels individually for a richer scorecard.
-from tripwire.targets import numeric, serde, sql, sum_reduction, tokenizer
+from tripwire.scorecard import ORACLES, TARGET_FACTORIES, Row, collect_rows, summarize
+from tripwire.target import VALID_TRUTHS
 
 REPO = Path(__file__).resolve().parent.parent
 RUNS_DIR = REPO / "runs"
 
-TARGET_FACTORIES = [
-    ("tokenizer", tokenizer.make_target),
-    ("serde", serde.make_target),
-    ("sum_reduction", sum_reduction.make_target),
-    ("numeric:dot", numeric.make_dot_target),
-    ("numeric:matvec", numeric.make_matvec_target),
-    ("numeric:matmul", numeric.make_matmul_target),
-    ("sql", sql.make_target),
+# Re-exported for backwards compatibility: TARGET_FACTORIES / ORACLES / Row /
+# collect_rows used to be defined here; tests and external callers still import
+# them from bench.run.
+__all__ = [
+    "ORACLES",
+    "Row",
+    "TARGET_FACTORIES",
+    "RUNS_DIR",
+    "collect_rows",
+    "print_scorecard",
+    "write_jsonl",
+    "main",
 ]
-
-ORACLES = ["naive_bitwise", "naive_tolerance", "layered"]
-
-
-@dataclass
-class Row:
-    domain: str
-    target: str
-    candidate: str
-    truth: str
-    verdicts: dict  # oracle -> (accepted: bool, reason: str)
-    layered_speedup: float
-    layered_lower_bound: float
-    layered_trustworthy: bool
-
-
-def _evaluate_candidate(t: Target, fn) -> dict:
-    return {
-        "naive_bitwise": naive_oracle(t, fn, "bitwise"),
-        "naive_tolerance": naive_oracle(t, fn, "tolerance"),
-        "layered": layered_oracle(t, fn),
-    }
-
-
-def collect_rows() -> list[Row]:
-    rows: list[Row] = []
-    for domain, factory in TARGET_FACTORIES:
-        t = factory()
-        for label, (fn, truth) in t.candidates.items():
-            verdicts = _evaluate_candidate(t, fn)
-            # Variance-bounded speedup only matters for candidates that passed the
-            # layered oracle (a rejected candidate is never credited -- ADR-006).
-            sp = lb = float("nan")
-            trustworthy = False
-            if verdicts["layered"].accepted:
-                ss = speedup_stats(t.reference, fn, t.canonical_args + t.withheld_args)
-                sp, lb, trustworthy = ss.speedup, ss.lower_bound, ss.trustworthy
-            rows.append(
-                Row(
-                    domain=domain,
-                    target=t.name,
-                    candidate=label,
-                    truth=truth,
-                    verdicts={k: (v.accepted, v.reason) for k, v in verdicts.items()},
-                    layered_speedup=sp,
-                    layered_lower_bound=lb,
-                    layered_trustworthy=trustworthy,
-                )
-            )
-    return rows
 
 
 def _fmt_speed(x: float) -> str:
@@ -133,28 +77,19 @@ def print_scorecard(rows: list[Row]) -> dict:
               f"{mark(v['layered']):>9}   {sp_str:<24}")
     print("-" * 104)
 
-    # ---- integrity metrics per oracle ----
+    # ---- integrity metrics per oracle (shared with the tripwire CLI) ----
     n_valid = sum(1 for r in rows if r.truth in VALID_TRUTHS)
     n_hack = sum(1 for r in rows if r.truth == "hack")
     print(f"\nSCORECARD  ({len(rows)} candidates = {n_valid} valid + {n_hack} reward-hacks; "
           f"across {len({r.domain for r in rows})} domains)")
     print("-" * 104)
     print(f"{'oracle':<18}{'ships_hacks':>13}{'integrity':>12}{'kept_valid':>13}{'verdict':>14}")
-    summary = {}
+    summary = summarize(rows)
     for o in ORACLES:
-        accepted = [r for r in rows if r.verdicts[o][0]]
-        hacks_shipped = sum(1 for r in accepted if r.truth == "hack")
-        valid_shipped = sum(1 for r in accepted if r.truth in VALID_TRUTHS)
-        integrity = (valid_shipped / len(accepted)) if accepted else float("nan")
-        kept_valid = (valid_shipped / n_valid) if n_valid else float("nan")
-        verdict = "TRUSTWORTHY" if (hacks_shipped == 0 and kept_valid == 1.0) else "unsafe"
-        summary[o] = {
-            "ships_hacks": hacks_shipped,
-            "integrity": integrity,
-            "kept_valid": kept_valid,
-            "trustworthy": verdict == "TRUSTWORTHY",
-        }
-        print(f"{o:<18}{hacks_shipped:>13}{integrity:>12.2f}{kept_valid:>12.0%}{verdict:>14}")
+        s = summary[o]
+        verdict = "TRUSTWORTHY" if s["trustworthy"] else "unsafe"
+        print(f"{o:<18}{s['ships_hacks']:>13}{s['integrity']:>12.2f}"
+              f"{s['kept_valid']:>12.0%}{verdict:>14}")
     print("-" * 104)
     print("READ:  only the LAYERED oracle ships ZERO hacks AND keeps every real win, "
           "across every domain.")
