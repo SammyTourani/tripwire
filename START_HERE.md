@@ -1,5 +1,10 @@
 # START HERE
 
+> **Note (historical).** This was the original build-handoff for creating Tripwire
+> from scratch with Claude Code. The project is now built and published — install it
+> with `pip install tripwire-oracle` and see the [README](README.md). The steps below
+> are kept for provenance.
+
 This is the build package for **Tripwire** — a layered, adversarial-by-design correctness oracle for AI
 code optimization, shipped as a drop-in OpenEvolve evaluator, plus a benchmark that measures how
 often AI optimizers ship reward-hacked code. Follow these steps to start building with Claude Code.

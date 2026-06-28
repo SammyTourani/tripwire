@@ -8,6 +8,10 @@ A `Target` (see `tripwire/target.py`) bundles everything the layered oracle need
 to judge a candidate optimization for one domain. You write **one `make_*_target()`
 factory per domain**, returning a validated `Target`.
 
+> **Tip:** `tripwire init your_function.py` scaffolds a fill-in-the-blanks Target
+> from a reference function (keeping it verbatim and carrying its imports); you then
+> fill in `canonical_args` / `withheld_args`. This guide explains every field.
+
 ## The five things a Target provides
 
 | field | what it is | feeds |

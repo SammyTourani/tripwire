@@ -37,3 +37,4 @@ dist/
 # Reward-hacking experiment run artifacts (regenerated)
 experiment-runs/
 uv.lock
+tripwire-runs/

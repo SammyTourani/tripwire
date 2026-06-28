@@ -1,189 +1,193 @@
-# Tripwire — a layered, adversarial-by-design correctness oracle for AI code optimization
+<div align="center">
 
-> **Status:** research artifact (Phase 3). The layered oracle is live across 7 domain targets, the
-> cross-domain benchmark and red-team suite run with no network, a live OpenEvolve loop (target zero)
-> drives the oracle end-to-end with Claude as the proposer, and the editorial replay of both artifacts
-> is on the web. Working name; rename freely.
->
-> **Live visualizer:** [sammytourani.github.io/tripwire](https://sammytourani.github.io/tripwire/) —
-> animated replay of the cross-domain scorecard and target zero.
+# Tripwire
 
-AI code optimizers are graded on a reward = **speedup**, gated by a *naive* correctness check
-(output-match, or a tolerance band on a fixed set of test inputs). That naive check fails in **two
-opposite directions**:
+**A layered, adversarial-by-design correctness oracle for AI code optimization.**
 
-- **It discards correct speedups (false negatives).** A correct, faster candidate — vectorization, a
-  reordered reduction, an FMA — shifts floating-point results in the low bits. A *bitwise* oracle
-  rejects a real win.
-- **It ships reward-hacks (false positives).** A candidate that memorizes / special-cases the visible
-  test inputs is correct on exactly those inputs and wrong everywhere else — and it looks almost
-  infinitely fast. A bitwise *or* a tolerance oracle ships it.
+[![PyPI](https://img.shields.io/pypi/v/tripwire-oracle.svg?color=e5484d)](https://pypi.org/project/tripwire-oracle/)
+[![Python](https://img.shields.io/pypi/pyversions/tripwire-oracle.svg)](https://pypi.org/project/tripwire-oracle/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Live visualizer](https://img.shields.io/badge/live-visualizer-e5484d.svg)](https://sammytourani.github.io/tripwire/)
 
-**Tripwire** is the layered oracle that is right on *both* axes, packaged as a drop-in evaluator for
-[OpenEvolve](https://github.com/algorithmicsuperintelligence/openevolve) so you never rebuild the
-optimization loop. Alongside it is the **Optimizer Integrity Bench (OIB)**, which puts a number on how
-often the naive checks current optimizers rely on either ship a hack or throw away a real win.
+![Tripwire CLI — launch, menu, demo, scorecard](docs/assets/tripwire-hero.gif)
 
-**See the result before reading further:** the
-[live visualizer](https://sammytourani.github.io/tripwire/) replays both the cross-domain scorecard
-and target zero (Claude in the loop). The rest of this README is the *why*.
+</div>
 
-## The four layers
+When an AI "optimizes" your code, how do you know the speedup is real and not a cheat? **Tripwire re-tests every optimized candidate on withheld, adversarial inputs it never saw — before any speedup can earn credit.** A candidate that memorized or special-cased the visible tests looks almost infinitely fast and passes a naive check; Tripwire catches it on the inputs it couldn't see.
 
-The oracle assumes every candidate is trying to cheat it (the documented Sakana CUDA-Engineer
-reward-hack — see `docs/threat-model.md`). The layer order is fixed; any correctness layer failing
-rejects the candidate, and **speed is only measured after correctness passes**.
+It ships as a one-command CLI *and* as a drop-in [OpenEvolve](https://github.com/algorithmicsuperintelligence/openevolve) evaluator, so you can use it standalone or wire it into an existing evolutionary loop without rebuilding anything.
+
+## Install
+
+```bash
+pip install tripwire-oracle
+tripwire demo
+```
+
+Zero-install (via [uv](https://github.com/astral-sh/uv)):
+
+```bash
+uvx --from tripwire-oracle tripwire demo
+```
+
+Run `tripwire` with no arguments for the interactive menu, or use the subcommands directly.
+
+## The catch with "faster" code
+
+AI code optimizers are rewarded for **speedup**, gated by a *naive* correctness check (output-match, or a tolerance band on a fixed set of test inputs). That naive check fails in **two opposite directions**:
+
+- **It ships reward-hacks (false positives).** A candidate that memorizes / special-cases the visible test inputs is correct on exactly those inputs and wrong everywhere else — and it looks almost infinitely fast. A bitwise *or* a tolerance oracle ships it.
+- **It discards correct speedups (false negatives).** A genuinely faster candidate — vectorization, a reordered reduction, an FMA — shifts floating-point results in the low bits. A *bitwise* oracle rejects a real win.
+
+Tripwire is the layered oracle that is right on *both* axes.
+
+## How it works — the four layers
+
+The oracle assumes every candidate is trying to cheat it (the documented Sakana CUDA-Engineer reward-hack — see [`docs/threat-model.md`](docs/threat-model.md)). The layer order is fixed; **any correctness layer failing rejects the candidate, and speed is only measured after correctness passes.**
 
 | layer | what it checks |
 |------|----------------|
 | **L1 — canonical correctness** | output-match on the visible inputs: *exact* for `structural` targets, *tolerance* for `numeric` ones (bitwise on numeric would discard real speedups). |
 | **L2 — metamorphic / property** | invariants the real computation must satisfy (e.g. scale-equivariance of a sum, count-conservation of a tokenizer) — these hold for the true function regardless of input. |
-| **L3 — differential on withheld + adversarial inputs** | re-checks the candidate against the reference on fresh, adversarial inputs it **never saw** (the moat: you cannot overfit to inputs you cannot see). |
+| **L3 — differential on withheld + adversarial inputs** | re-checks the candidate against the reference on fresh, adversarial inputs it **never saw** — *the moat*: you cannot overfit to inputs you cannot see. |
 | **L4 — isolated speedup** | only now is speed measured — warmed up, best-of-N, across multiple shapes, with a variance lower bound so no "speedup" is phantom noise. |
 
-A correctness failure zeroes the reward, so a reward-hack can never earn a score.
+`tripwire verify --example` shows it on a real optimization and a planted hack, with zero setup:
+
+![tripwire verify --example](docs/assets/cli-verify-example.png)
+
+The real win is **accepted**; the memorized hack passes L1/L2 but is **rejected at L3** — caught on inputs it never saw.
 
 ## The result, measured (no network, no LLM)
 
-`python -m bench.run` runs all 7 domain targets through all three oracles. Across the **20 labeled
-candidates** in the current benchmark (3 correct, 4 correct-up-to-FP, 13 reward-hacks), the scorecard
-is stable across runs:
+`tripwire demo` runs all 7 domain targets through three oracles. Across the **20 labeled candidates** in the benchmark (3 correct, 4 correct-up-to-FP, 13 reward-hacks), the scorecard is stable across runs:
 
+![tripwire demo — the integrity scorecard](docs/assets/cli-demo.png)
+
+- **naive (bitwise)** ships 9 of 13 hacks *and* discards every floating-point-correct win (keeps only 43% of valid candidates).
+- **naive (tolerance)** keeps every real win but ships **every single hack** — 13 of 13.
+- **layered (Tripwire)** ships **0 hacks** and keeps **100%** of valid wins, across every domain → `TRUSTWORTHY`.
+
+The demo exits non-zero if that ever stops holding (the regression gate). The live domains: `tokenizer` and `serde` (structural, exact), `sum_reduction` and the `numeric` family (`dot`, `matvec`, `matmul` — tolerance + metamorphic), and `sql` (whose withheld layer is a SQL-semantics fuzzer hitting NULLs / three-valued logic / duplicate keys / empty groups, with the DB engine as ground truth).
+
+## Use it on your own code
+
+A **Target** tells the oracle how to judge your problem: a slow-but-correct reference, the canonical inputs the optimizer may see, the **withheld adversarial inputs** it may not (the moat), and optional metamorphic properties.
+
+**1. Scaffold a Target from your reference function:**
+
+```bash
+tripwire init your_function.py
 ```
-SCORECARD                       (20 candidates across 7 domain targets)
-oracle              ships_hacks  integrity  kept_valid       verdict
-naive_bitwise                 9       0.25         43%        unsafe
-naive_tolerance              13       0.35        100%        unsafe
-layered                       0       1.00        100%   TRUSTWORTHY
+
+![tripwire init](docs/assets/cli-init.png)
+
+Fill in the `canonical_args` / `withheld_args` TODOs (full contract in [`docs/target-authoring.md`](docs/target-authoring.md)). The withheld inputs are the moat — make them adversarial, not more-of-the-same.
+
+**2. Verify any candidate against it:**
+
+```bash
+tripwire verify your_target.py your_candidate.py
 ```
 
-- **naive_bitwise** ships 9 of 13 hacks *and* discards every floating-point-correct win (it keeps
-  only 43% of valid candidates — every `correct_fp` candidate, the FMA / reordered-reduction wins,
-  gets thrown away).
-- **naive_tolerance** keeps every real win but ships **every single hack** — 13 of 13.
-- **layered** ships **0 hacks** and keeps **100%** of valid wins, across every domain →
-  `TRUSTWORTHY`. `bench.run.main()` exits non-zero if that ever stops holding (the regression gate).
+**3. Or run a real optimization loop, oracle-graded end to end:**
 
-### Live domains (7 target instances)
+```bash
+tripwire optimize your_target.py
+```
 
-`tokenizer` and `serde` (structural, exact oracle), `sum_reduction` and the `numeric` family
-(`dot`, `matvec`, `matmul` — tolerance + metamorphic), and `sql` (whose withheld layer is a
-SQL-semantics fuzzer hitting NULLs / three-valued logic / duplicate keys / empty groups, with the DB
-engine as ground truth). Each ships a planted reward-hack the oracle is expected to catch.
+`optimize` runs a real OpenEvolve loop — an LLM proposes faster code and Tripwire's layered oracle grades every proposal, so the loop can never be rewarded for a hack. It needs the `runner` extra and an LLM key:
 
-### Red-team attack suite
+![tripwire optimize prerequisites](docs/assets/cli-optimize.png)
 
-`python -m bench.attack_suite` continuously throws hand-built reward-hacks (memorize-canonical,
-constant-return, skip-the-work) at the oracle. Current result: the **layered oracle caught 9/9
-attacks (0 hacks shipped)** while the naive oracles shipped 5. Every attack that ever lands becomes a
-new layer or a new withheld-input distribution.
+```bash
+pip install "tripwire-oracle[runner]"
+export OPENAI_API_KEY=...           # any OpenAI-compatible endpoint
+export OPENEVOLVE_MODEL=gpt-4o-mini # the proposer model
+# OPENAI_BASE_URL is optional (defaults to OpenAI; point it at any compatible proxy)
+tripwire optimize your_target.py
+```
 
-### Why the magnitudes here are illustrative
+### Drop it into an existing OpenEvolve loop
 
-The recorded benchmark stores `layered_speedup` only for candidates the layered oracle accepted, and
-the four FP-correct numeric wins that `naive_bitwise` throws away are real and large on this machine
-— `sum_reduction` **180×**, `numeric:dot` **849×**, `numeric:matvec` **3,536×**, `numeric:matmul`
-**4,294×** (each with a measured lower bound; see `viz/public/data/bench.jsonl`). The 13 reward-hacks
-are all rejected at L1/L2/L3, so their "speedups" are never measured by the layered oracle (that is
-the design — a hack must never earn a number). When a hack ships through a naive oracle in the wild,
-its apparent speedup is a function of how aggressively it skips work; the visualizer's hack-row bars
-are deliberately illustrative for that reason. **All timing ratios are hardware-dependent in absolute
-magnitude; what is invariant is the direction — the kept wins are real and the rejected hacks fail on
-the withheld inputs.**
+The oracle is decoupled — it imports nothing from OpenEvolve. Wrap any Target as an OpenEvolve evaluator:
+
+```python
+from tripwire.evaluator import make_openevolve_evaluator
+from your_target import make_target
+
+evaluate = make_openevolve_evaluator(make_target())   # returns {combined_score, correct, speedup, reason}
+# hand `evaluate` to openevolve.run_evolution(...) as the evaluator
+```
+
+A correctness failure (L1/L2/L3) zeroes the score, so a reward-hack can never earn one.
+
+## CLI reference
+
+| command | what it does |
+|--------|--------------|
+| `tripwire demo` | the cross-domain integrity scorecard (no setup) |
+| `tripwire verify TARGET CANDIDATE` | verify one optimized candidate (`--example` to try a bundled one) |
+| `tripwire init REFERENCE.py` | scaffold a Target skeleton from your function |
+| `tripwire optimize TARGET` | run a real OpenEvolve loop, oracle-graded (`--example` to try one) |
+| `tripwire explain` | how the 4-layer oracle works |
 
 ## Target zero — a COMPILOT-inspired live loop, with Claude as the proposer
 
-`runner/target_zero.py` wires the layered oracle (via the OpenEvolve evaluator) into a real,
-network-backed OpenEvolve run with **Claude (Opus 4.8)** proposing optimizations of a Python numeric
-kernel (`sum_reduction`). The recorded run (`runs/target-zero.jsonl`,
-`runs/target-zero-summary.json`) reached a **200.28×** speedup at iteration 5, verified through all
-four layers; the
-[visualizer's target-zero section](https://sammytourani.github.io/tripwire/#target-zero) replays the
-full 10-iteration trace, with the candidate code, Claude's reasoning, and the oracle's verdict per
-iteration.
+[![live visualizer](docs/assets/site-hero.png)](https://sammytourani.github.io/tripwire/)
 
-**Honest framing:** this is **COMPILOT-*inspired*, not a COMPILOT reproduction.** COMPILOT
-(arXiv:2511.00592) optimizes **C loop nests** through the **Tiramisu polyhedral compiler** with
-**formal legality checking**; target zero optimizes a **Python kernel** judged by Tripwire's
-**empirical layered oracle**. What it reproduces is the *principle* the paper validates in RQ7 —
-**delegate correctness to a rigorous verifier rather than trusting the LLM to be correct** — not the
-system. It also fills a literal gap in the paper: COMPILOT's Table I evaluated Gemini / GPT / o3 /
-Llama / Gemma / QwQ / Qwen / Codestral, but **never an Anthropic model**. Running it needs network
-and an LLM key (read from a local, gitignored `.env`).
+`runner/target_zero.py` wires the layered oracle into a real, network-backed OpenEvolve run with **Claude (Opus 4.8)** proposing optimizations of a Python numeric kernel. The recorded run reached a **200×** speedup verified through all four layers; the **[live visualizer](https://sammytourani.github.io/tripwire/)** replays the full trace — candidate code, Claude's reasoning, and the oracle's verdict per iteration — alongside the cross-domain scorecard.
 
-## Novelty claim (calibrated — the README stays inside this)
+**Honest framing:** this is **COMPILOT-*inspired*, not a COMPILOT reproduction.** COMPILOT (arXiv:2511.00592) optimizes **C loop nests** through the **Tiramisu polyhedral compiler** with **formal legality checking**; target zero optimizes a **Python kernel** judged by Tripwire's **empirical layered oracle**. What it reproduces is the *principle* the paper validates in RQ7 — **delegate correctness to a rigorous verifier rather than trusting the LLM to be correct** — not the system. It also fills a literal gap in the paper: COMPILOT's Table I evaluated Gemini / GPT / o3 / Llama / Gemma / QwQ / Qwen / Codestral, but **never an Anthropic model**.
 
-Metamorphic testing, differential testing, and property-based testing are **decades old** — Tripwire
-does **not** claim to invent any of them. What does not exist in the wild, per extensive search, is:
+## Does the moat beat a judge? (research, in progress)
 
-1. a clean, cross-optimizer **measurement** of the reward-hacking / silent-correctness-failure rate
-   across the dominant open optimization stack, and
+A reasonable question: does the withheld-adversarial-input moat actually catch hacks that a strong **LLM-judge** baseline (one model reading the candidate and deciding) would miss? The harness for that experiment lives in [`experiment/`](experiment/) with the plan in [`docs/reward-hacking-experiment.md`](docs/reward-hacking-experiment.md). It runs each candidate three ways — an independent ground-truth referee, the Tripwire moat, and an LLM judge — and reports where they disagree. This is an open question, and "the judge does about as well" would be a valid, publishable finding.
+
+## Novelty claim (calibrated)
+
+Metamorphic, differential, and property-based testing are **decades old** — Tripwire does **not** claim to invent any of them. What did not exist in the wild, per extensive search, is:
+
+1. a clean, cross-optimizer **measurement** of the reward-hacking / silent-correctness-failure rate across the dominant open optimization stack, and
 2. a **reusable, adversarial-by-design oracle packaged as a component** for that stack (OpenEvolve).
 
-COMPILOT proved the *principle* — delegate correctness to something rigorous — for one narrow domain
-(polyhedral loop nests, Tiramisu backend). Tripwire generalizes and hardens it into the missing piece.
+COMPILOT proved the *principle* — delegate correctness to something rigorous — for one narrow domain (polyhedral loop nests, Tiramisu backend). Tripwire generalizes and hardens it into the missing piece.
 
-## Status / limitations
+## Status & limitations
 
-This is a research artifact, not a finished product, and the claim is deliberately bounded:
+This is a research artifact, and the claim is deliberately bounded:
 
-- **Tripwire is a correctness oracle, not a Python sandbox.** Its layered design is
-  adversarial-by-design against a gradient-following optimizer (the documented Sakana failure mode),
-  and the candidate-execution boundary has been hardened against in-process tampering, IPC-channel
-  RCE, verdict hijacking, and timing-forge (see `tests/test_isolation_security.py`). Pure-Python
-  in-process sandboxing of fully-adversarial code is a published negative result — see PEP 551 and
-  the pysandbox post-mortem — and Tripwire does not claim to have solved it. If you run Tripwire
-  against an LLM you do not trust to be benign at the OS level (file writes, network egress,
-  fork-bombs), deploy the evaluator under gVisor, Firecracker, or a hardened container, exactly as
-  you would for any other untrusted Python execution. The contract is on the *correctness axis*: a
-  wrong candidate cannot earn reward, regardless of what it does inside its sandbox process.
-- The oracle is only as strong as the attacks it has survived, which is why the red-team suite is a
-  permanent, growing fixture.
-- Numeric correctness rests on tolerance + metamorphic relations and a withheld differential, not on
-  a formal proof; soundness depends on the target author choosing good properties and adversarial
-  withheld inputs.
-- Speedups are empirical measurements (warmed up, best-of-N, variance-bounded) — robust to noise, but
-  still machine-dependent in absolute magnitude.
-- The benchmark uses planted, labeled candidates to *measure* oracle behavior; it is a controlled
-  harness, not a survey of optimizers in the wild.
+- **Tripwire is a correctness oracle, not a Python sandbox.** The layered design is adversarial-by-design against a gradient-following optimizer (the documented Sakana failure mode), and the candidate-execution boundary is hardened against in-process tampering, IPC-channel RCE, verdict hijacking, and timing-forge (see `tests/test_isolation_security.py`). But pure-Python in-process sandboxing of fully-adversarial code is a published negative result (PEP 551, the pysandbox post-mortem) and Tripwire does not claim to have solved it. If you run it against an LLM you do not trust at the OS level (file writes, network egress, fork-bombs), deploy the evaluator under gVisor, Firecracker, or a hardened container. The contract is on the *correctness axis*: a wrong candidate cannot earn reward, regardless of what it does inside its sandbox process.
+- The oracle is only as strong as the attacks it has survived, which is why the red-team suite is a permanent, growing fixture.
+- Numeric correctness rests on tolerance + metamorphic relations and a withheld differential, not a formal proof; soundness depends on the target author choosing good properties and adversarial withheld inputs.
+- Speedups are empirical (warmed up, best-of-N, variance-bounded) — robust to noise, but machine-dependent in absolute magnitude.
+- The benchmark uses planted, labeled candidates to *measure* oracle behavior; it is a controlled harness, not a survey of optimizers in the wild.
 
-## Run it
+## Development / from source
 
-The project is a Python 3.12 package and runs out of a venv. Bare `python` may not exist on your
-machine — use the venv's interpreter (`.venv/bin/python`). The seed and benchmarks import the
-*installed* `tripwire` package, so install it editable first. This repo's venv is `uv`-managed (it has
-no `pip`), so the working install here is:
+The project is a Python 3.12 package. The repo's venv is `uv`-managed:
 
 ```bash
-# one-time: install the package (editable) + dev tools into the venv
-uv pip install -e ".[dev]"
-# (on a plain pip venv instead:  python3 -m venv .venv && .venv/bin/python -m pip install -e ".[dev]")
-
-# smoke test / regression baseline (the Phase-0 seed; imports the installed package)
-.venv/bin/python optimizer_integrity_bench.py
-
-# the cross-domain scorecard + a JSONL event log under runs/
-.venv/bin/python -m bench.run
-
-# the red-team attack suite
-.venv/bin/python -m bench.attack_suite
-
-# tests
-.venv/bin/python -m pytest
+uv pip install -e ".[dev]"     # editable install + dev tools
+uv run tripwire demo           # the scorecard
+uv run python -m bench.run     # cross-domain scorecard + JSONL log under runs/
+uv run python -m bench.attack_suite   # the red-team attack suite
+uv run pytest                  # tests
 ```
 
-The OpenEvolve loop (target zero) additionally needs the `runner` extra and a network + LLM key:
-`uv pip install -e ".[runner]"`, then `.venv/bin/python -m runner.target_zero`.
+The screenshots and the hero GIF above are regenerated from the committed [`docs/assets/tapes/`](docs/assets/tapes/) with [vhs](https://github.com/charmbracelet/vhs).
 
-## Files
-- `CLAUDE.md` — the source-of-truth spec for any agent on this repo.
-- `BUILD_PLAN.md` — the phased plan and the parallel gate.
+## Repo map
+
+- `tripwire/cli.py` — the interactive CLI (presentation + dispatch only).
 - `tripwire/oracle.py` — the layered oracle (the crown jewel); `tripwire/measure.py` — hardened timing.
-- `tripwire/target.py` — Interface A (the `Target` plug-in contract); `tripwire/targets/` — one file per domain.
-- `tripwire/evaluator.py` — Interface B (the OpenEvolve adapter; correctness failure zeroes the score).
-- `bench/run.py` — the cross-domain scorecard + JSONL log; `bench/attack_suite.py` — the red-team suite.
-- `runner/` — target zero (the live OpenEvolve loop with Claude).
-- `viz/` — the editorial replay UI; deployed to GitHub Pages automatically by `.github/workflows/pages.yml`.
-- `optimizer_integrity_bench.py` — the proven Phase-0 seed, kept runnable as a regression smoke test.
-- `docs/` — `threat-model.md` (the adversary, sourced), `decisions.md` (the ADRs), `target-authoring.md`,
-  and `compilot-paper.pdf`.
+- `tripwire/target.py` — the `Target` plug-in contract; `tripwire/targets/` — one file per domain.
+- `tripwire/evaluator.py` — the OpenEvolve adapter (correctness failure zeroes the score).
+- `tripwire/optimize.py` / `tripwire/scaffold.py` — the generic `optimize` loop and `init` scaffolder.
+- `bench/` — the cross-domain scorecard + the red-team suite; `experiment/` — the moat-vs-judge harness.
+- `runner/` — target zero (the live OpenEvolve loop with Claude); `viz/` — the editorial replay UI (deployed to GitHub Pages).
+- `docs/` — `threat-model.md`, `decisions.md` (ADRs), `target-authoring.md`, `reward-hacking-experiment.md`.
+
+## License
+
+[MIT](LICENSE).
