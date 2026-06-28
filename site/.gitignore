@@ -1,0 +1,12 @@
+node_modules
+dist
+.output
+.nitro
+.tanstack
+.vinxi
+*.local
+.DS_Store
+# lockfiles intentionally untracked (CI installs from public npm; see pages.yml)
+package-lock.json
+bun.lock
+bun.lockb
