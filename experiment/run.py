@@ -116,36 +116,39 @@ def run_models(models, *, judge_model, samples, output_dir, tempt=False) -> int:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     records = []
+    log = out / "records.jsonl"
     workdir = Path(tempfile.mkdtemp(prefix="tripwire-exp-"))
+    # Write each record as it is decided (and flush) so a long, rate-limited run that is
+    # killed or crashes still leaves the partial results on disk instead of nothing.
     try:
-        for name, factory in TARGET_FACTORIES:
-            target = factory()
-            for model in models:
-                print(f"[{name}] generating {samples} candidate(s) from {model} …")
-                candidates = generate_candidates(target, model=model, n=samples, tempt=tempt)
-                safe = name.replace(":", "_") + "_" + model.replace("/", "_")
-                for i, source in enumerate(candidates):
-                    cand_file = workdir / f"{safe}_{i}.py"
-                    # prepend common imports so a candidate that uses numpy/math without
-                    # importing it still loads (duplicate imports are harmless).
-                    cand_file.write_text("import numpy as np\nimport math\n\n" + source)
-                    truth, moat, judge_v = evaluate_candidate_isolated(
-                        target, str(cand_file), candidate_source=source, judge_model=judge_model
-                    )
-                    rec = {"target": target.name, "model": model, "candidate": i,
-                           "truth": truth, "moat": moat, "judge": judge_v,
-                           "mode": "tempt" if tempt else "plain"}
-                    records.append(rec)
-                    print(f"    cand {i}: truth={truth:<7} moat={moat:<7} judge={judge_v}")
+        with log.open("w") as f:
+            for name, factory in TARGET_FACTORIES:
+                target = factory()
+                for model in models:
+                    print(f"[{name}] generating {samples} candidate(s) from {model} …", flush=True)
+                    candidates = generate_candidates(target, model=model, n=samples, tempt=tempt)
+                    safe = name.replace(":", "_") + "_" + model.replace("/", "_")
+                    for i, source in enumerate(candidates):
+                        cand_file = workdir / f"{safe}_{i}.py"
+                        # prepend common imports so a candidate that uses numpy/math
+                        # without importing it still loads (duplicate imports are harmless).
+                        cand_file.write_text("import numpy as np\nimport math\n\n" + source)
+                        truth, moat, judge_v = evaluate_candidate_isolated(
+                            target, str(cand_file), candidate_source=source, judge_model=judge_model
+                        )
+                        rec = {"target": target.name, "model": model, "candidate": i,
+                               "truth": truth, "moat": moat, "judge": judge_v,
+                               "mode": "tempt" if tempt else "plain"}
+                        records.append(rec)
+                        f.write(json.dumps(rec) + "\n")
+                        f.flush()
+                        print(f"    cand {i}: truth={truth:<7} moat={moat:<7} judge={judge_v}",
+                              flush=True)
     finally:
         import shutil
 
         shutil.rmtree(workdir, ignore_errors=True)
 
-    log = out / "records.jsonl"
-    with log.open("w") as f:
-        for r in records:
-            f.write(json.dumps(r) + "\n")
     _print_headline(records)
     print(f"\nrecords: {log}")
     return 0
