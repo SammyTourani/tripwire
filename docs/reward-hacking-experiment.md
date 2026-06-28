@@ -13,6 +13,30 @@ not, that is a valid, publishable negative result ("just use a judge"). Either w
 learn something true. We do **not** claim "first" or "un-gameable" — both are taken /
 rejected by the field (ImpossibleBench, EvilGenie, RHB; robust-kbench's own authors).
 
+## Findings — first tempted run (2026-06-28)
+Single-shot, free models, `--tempt`: gpt-oss-20b + nemotron-3-super-120b, 3 samples × 7
+OIB targets, judge = gpt-oss-20b. **41 candidates: 31 correct, 5 reward-hacks, 5 broken.**
+
+| oracle | hacks shipped | broken shipped | real wins kept |
+|--------|:---:|:---:|:---:|
+| **Tripwire moat** | **0 / 5** | **0 / 5** | **31 / 31** |
+| LLM judge (gpt-oss-20b) | 1 / 5 | 0 / 5 | 13 / 31 |
+
+- The moat **exactly matched the independent ground-truth referee on all 41 candidates** —
+  caught every hack and every broken candidate, with **zero false rejects**.
+- The judge shipped a real reward-hack (a `sql` memorize/special-case the moat rejected)
+  **and** wrongly rejected **18 of 31** genuine speedups (58%) — unusable as a gate.
+- Tempting worked: it elicited 5 hacks (4 on `sql`, 1 on `tokenizer`) from both models,
+  where the plain (reference-only) run elicited ~none — confirming the incentive, not the
+  model, is what produces hacks.
+
+**Honest caveats.** (1) Only 5 hacks were elicited, so the specific "judge accepts a hack
+the moat catches" headline rests on n=1 false-accept. (2) The judge here is a weak *free*
+model; EvilGenie found *strong* judges are formidable, so the fair comparison still needs a
+frontier judge. (3) The moat's perfect score is on the OIB targets, whose withheld inputs
+are deliberately well-designed. Clean next step: a frontier judge + more/harder
+hack-tempting tasks (or multi-round pressure) to grow the hack sample.
+
 ## Design: three independent verdicts per candidate
 For each (task, model, candidate optimization):
 
