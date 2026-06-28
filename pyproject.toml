@@ -4,9 +4,11 @@
 # The import package and the console command both stay `tripwire` (see
 # [tool.setuptools] packages and [project.scripts]); only `pip install` differs.
 name = "tripwire-oracle"
-version = "0.1.0"
+version = "0.2.0"
 description = "A layered, adversarial-by-design correctness oracle for LLM-driven code optimization, packaged as a drop-in OpenEvolve evaluator."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Sammy Tourani" }]
 keywords = [
     "llm",
@@ -68,7 +70,8 @@ runner = [
 tripwire = "tripwire.cli:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+# >=77 for PEP 639 SPDX license expressions (`license = "MIT"` + `license-files`).
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

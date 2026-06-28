@@ -348,40 +348,15 @@ def run_demo(console, *, banner=True):
 # verify
 # --------------------------------------------------------------------------- #
 def _load_target(console, path):
-    import importlib.util
+    """Load a Target from a user .py (shared by verify and optimize). Returns the
+    Target, or None after printing the reason."""
+    from tripwire.optimize import OptimizeError, load_target
 
-    if not os.path.exists(path):
-        console.print(f"  [red]target file not found:[/red] {path}")
-        return None
     try:
-        spec = importlib.util.spec_from_file_location("user_target", path)
-        if spec is None or spec.loader is None:
-            console.print(f"  [red]could not load target file:[/red] {path}")
-            return None
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-    except Exception as e:
-        console.print(f"  [red]could not import target file:[/red] {type(e).__name__}: {e}")
+        return load_target(path)
+    except OptimizeError as e:
+        console.print(f"  [red]{e}[/red]")
         return None
-
-    from tripwire.target import Target
-
-    target = getattr(mod, "target", None)
-    if target is None:
-        factory = getattr(mod, "make_target", None)
-        if callable(factory):
-            try:
-                target = factory()
-            except Exception as e:
-                console.print(f"  [red]make_target() raised:[/red] {type(e).__name__}: {e}")
-                return None
-    if not isinstance(target, Target):
-        console.print(
-            "  [red]the target file must define a `target` (a Target) or `make_target()`.[/red]"
-        )
-        console.print("  see [bold]docs/target-authoring.md[/bold] for the contract.", style=MUTE)
-        return None
-    return target
 
 
 _LAYERS = [
@@ -515,20 +490,41 @@ def run_verify(console, target_path, candidate_path, *, isolate=True):
 # --------------------------------------------------------------------------- #
 # optimize
 # --------------------------------------------------------------------------- #
-def run_optimize(console, target_path=None):
-    from rich.console import Group
-    from rich.panel import Panel
-    from rich.text import Text
+def _prepare_optimize_env(console):
+    """Load a local .env (with a visible notice + a base-URL safety guard), then
+    report (openevolve installed?, OPENAI_API_KEY set?, OPENEVOLVE_MODEL set?).
 
+    Called by both the direct command and the interactive menu so each sees the .env
+    BEFORE the prereq check. The safety guard refuses a .env-supplied OPENAI_BASE_URL
+    when the API key comes from the real shell -- otherwise a foreign .env in the
+    current directory could redirect your real key to an attacker endpoint."""
+    from tripwire.optimize import load_dotenv
+
+    key_preset = "OPENAI_API_KEY" in os.environ
+    base_preset = "OPENAI_BASE_URL" in os.environ
+    loaded = load_dotenv()
+    if loaded:
+        console.print(f"  [dim]loaded environment from {loaded}[/dim]")
+        if key_preset and not base_preset and os.environ.get("OPENAI_BASE_URL"):
+            del os.environ["OPENAI_BASE_URL"]
+            console.print(
+                "  [yellow]ignored OPENAI_BASE_URL from .env (your API key is from the "
+                "shell; refusing to redirect it — export OPENAI_BASE_URL to override).[/yellow]"
+            )
     try:
         import openevolve  # noqa: F401
 
         have_oe = True
     except Exception:
         have_oe = False
-    have_key = bool(
-        os.environ.get("OPENAI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
-    )
+    return have_oe, bool(os.environ.get("OPENAI_API_KEY")), bool(os.environ.get("OPENEVOLVE_MODEL"))
+
+
+def _optimize_prereq_panel(console, have_oe, have_key, have_model, target_path):
+    """Shown when optimize can't run yet -- explains exactly what's missing."""
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.text import Text
 
     def status(ok, yes, no):
         g, c = ("✓", "green") if ok else ("✗", "red")
@@ -539,26 +535,27 @@ def run_optimize(console, target_path=None):
 
     body = Group(
         Text(
-            "Optimize runs a real OpenEvolve loop: an LLM proposes faster code, and "
+            "Optimize runs a real OpenEvolve loop: an LLM proposes faster code and "
             "Tripwire’s layered oracle grades every proposal — so the loop can never be "
             "rewarded for a hack.",
             style="#f5f5f5",
         ),
         Text(),
-        Text("prerequisites:", style="bold #f5f5f5"),
-        status(have_oe, "OpenEvolve installed", "OpenEvolve not installed"),
-        status(
-            have_key,
-            "LLM API key found in the environment",
-            "no LLM API key (set ANTHROPIC_API_KEY or OPENAI_API_KEY)",
-        ),
+        Text("usage:", style="bold #f5f5f5"),
+        Text("  tripwire optimize <target.py> [--iterations N]", style=f"bold {RED}"),
         Text(),
-        Text("to install the loop extra:", style=MUTE),
-        Text('  uvx --from "tripwire[runner]" tripwire optimize …', style=f"bold {RED}"),
+        Text("prerequisites:", style="bold #f5f5f5"),
+        status(
+            have_oe,
+            "OpenEvolve installed",
+            "OpenEvolve not installed — pip install 'tripwire-oracle[runner]'",
+        ),
+        status(have_key, "OPENAI_API_KEY set", "OPENAI_API_KEY not set"),
+        status(have_model, "OPENEVOLVE_MODEL set", "OPENEVOLVE_MODEL not set (e.g. gpt-4o-mini)"),
+        status(bool(target_path), "target file given", "no target file given"),
         Text(),
         Text(
-            "Running a full loop on your own Target is the next feature. Today’s working "
-            "reference run is runner/target_zero.py (a live Claude-driven loop) in the repo.",
+            "OPENAI_BASE_URL is optional (defaults to OpenAI; point it at any compatible proxy).",
             style=MUTE,
         ),
     )
@@ -568,11 +565,106 @@ def run_optimize(console, target_path=None):
             body,
             title="[bold]optimize[/bold]",
             title_align="left",
-            border_style=RED if (have_oe and have_key) else AMBER,
+            border_style=AMBER,
             padding=(1, 2),
         )
     )
-    return 0
+    # Non-zero: a missing prerequisite means optimize ran nothing -- a CI/script
+    # should see a failure (matches verify's error-path exit codes).
+    return 2
+
+
+def run_optimize(
+    console, target_path=None, *, iterations=None, initial_path=None, output_dir=None, env=None
+):
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.syntax import Syntax
+    from rich.text import Text
+
+    from tripwire.optimize import DEFAULT_ITERATIONS, OptimizeError, run_optimization
+
+    if iterations is None:
+        iterations = DEFAULT_ITERATIONS
+
+    # `env` lets the interactive menu prepare the environment once and pass the result
+    # in (avoids a second .env notice); otherwise prepare it here.
+    have_oe, have_key, have_model = env if env is not None else _prepare_optimize_env(console)
+    if not (have_oe and have_key and have_model and target_path):
+        return _optimize_prereq_panel(console, have_oe, have_key, have_model, target_path)
+
+    target = _load_target(console, target_path)
+    if target is None:
+        return 1
+
+    console.print()
+    hdr = Text("  ")
+    hdr.append("optimizing ", style="#f5f5f5")
+    hdr.append(target.name, style=f"bold {RED}")
+    hdr.append(
+        f" — {iterations} iterations, each a real (paid) LLM call to "
+        f"{os.environ.get('OPENEVOLVE_MODEL')}",
+        style=MUTE,
+    )
+    console.print(hdr)
+    console.print(
+        "  [dim]propose → oracle-verify on withheld inputs → measure speedup[/dim]\n"
+    )
+
+    try:
+        result = run_optimization(
+            target_path,
+            iterations=iterations,
+            initial_path=initial_path,
+            output_dir=output_dir,
+            target=target,
+        )
+    except OptimizeError as e:
+        console.print(f"  [red]{e}[/red]")
+        return 1
+    except Exception as e:  # noqa: BLE001 -- OpenEvolve / runtime failure
+        console.print(f"  [red]optimization failed:[/red] {type(e).__name__}: {e}")
+        return 1
+
+    is_win = result.correct and result.best_speedup >= 1.05
+    if result.correct:
+        head = Text()
+        head.append("BEST: ", style="bold green")
+        if is_win:
+            head.append(f"{result.best_speedup:,.1f}× faster", style=f"bold {RED}")
+            head.append("  (oracle-verified correct on withheld inputs)", style="#f5f5f5")
+        else:
+            head.append("verified correct", style="#f5f5f5")
+            head.append("  (no clear speedup found this run)", style=MUTE)
+        border = "green"
+    else:
+        head = Text()
+        head.append("no verified improvement", style="bold red")
+        if result.reason:
+            head.append(f"  — {result.reason}", style=MUTE)
+        border = "red"
+
+    parts = [Text(f"target: {target.name}", style=MUTE), Text(), head]
+    if result.best_code:
+        parts += [
+            Text(),
+            Text("best solve:", style="bold #f5f5f5"),
+            Syntax(result.best_code, "python", theme="ansi_dark", word_wrap=True),
+        ]
+    if result.best_path:
+        parts += [Text(), Text(f"saved: {result.best_path}", style=MUTE)]
+
+    console.print()
+    console.print(
+        Panel(
+            Group(*parts),
+            title="[bold]optimize[/bold]",
+            title_align="left",
+            border_style=border,
+            padding=(1, 2),
+        )
+    )
+    return 0 if result.correct else 1
 
 
 # --------------------------------------------------------------------------- #
@@ -596,7 +688,22 @@ def _dispatch_interactive(console, choice):
             return 1
         return run_verify(console, target, candidate, isolate=True)
     if choice == "optimize":
-        return run_optimize(console)
+        prep = _prepare_optimize_env(console)  # loads .env BEFORE the prereq check
+        _, have_key, have_model = prep
+        if not (have_key and have_model):
+            return run_optimize(console, env=prep)  # prereq panel explains what's missing
+        console.print()
+        try:
+            target = console.input(
+                "  [bold]target file[/bold] (.py with `target` / `make_target`): "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n  [dim]cancelled.[/dim]")
+            return 0
+        if not target:
+            console.print("  [red]need a target file.[/red]")
+            return 1
+        return run_optimize(console, target, env=prep)
     return 0
 
 
@@ -643,6 +750,14 @@ def _build_parser():
         help="run a real OpenEvolve loop (needs the runner extra + an LLM key)",
     )
     po.add_argument("target", nargs="?", help="path to a .py exposing `target` or `make_target()`")
+    po.add_argument(
+        "--iterations", type=int, default=None, help="number of loop iterations (default 10)"
+    )
+    po.add_argument(
+        "--initial",
+        help="explicit initial program .py (default: derived from the target's reference)",
+    )
+    po.add_argument("--output", help="output directory (default ./tripwire-runs)")
 
     return parser
 
@@ -651,7 +766,7 @@ def _version():
     try:
         from importlib.metadata import version
 
-        return version("tripwire")
+        return version("tripwire-oracle")
     except Exception:
         return "0+unknown"
 
@@ -685,7 +800,13 @@ def main(argv=None):
     if args.command == "verify":
         return run_verify(console, args.target, args.candidate, isolate=not args.trust)
     if args.command == "optimize":
-        return run_optimize(console, args.target)
+        return run_optimize(
+            console,
+            args.target,
+            iterations=args.iterations,
+            initial_path=args.initial,
+            output_dir=args.output,
+        )
 
     parser.print_help()
     return 0
