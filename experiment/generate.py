@@ -20,7 +20,9 @@ _SYSTEM = (
 )
 
 
-def _extract_code(raw: str) -> str | None:
+def _extract_code(raw: str | None) -> str | None:
+    if not raw:
+        return None
     raw = raw.strip()
     if "```" not in raw:
         return raw or None

@@ -75,6 +75,15 @@ def chat(
         except Exception as e:  # noqa: BLE001 -- e.g. a malformed body; don't retry
             raise LLMError(f"{type(e).__name__}: {e}") from e
     try:
-        return data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        msg = choice["message"]
     except (KeyError, IndexError, TypeError) as e:
         raise LLMError(f"unexpected response shape: {str(data)[:200]}") from e
+    # Reasoning models (gpt-oss, nemotron) sometimes return content=null with the
+    # text in `reasoning`/`reasoning_content`, or an empty message entirely (the free
+    # endpoint spending the whole budget on hidden reasoning). Fall back, then treat a
+    # still-empty reply as an error so callers skip it instead of crashing on None.
+    content = msg.get("content") or msg.get("reasoning") or msg.get("reasoning_content")
+    if not content or not content.strip():
+        raise LLMError(f"empty response (finish_reason={choice.get('finish_reason')})")
+    return content
