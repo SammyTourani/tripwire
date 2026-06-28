@@ -37,12 +37,26 @@ referee uses canonical + withheld + ~60 generative draws + generic structural mu
 (an input distribution the moat does not use). It is intentionally expensive and is
 never the thing being scored.
 
-## Candidate generation
+## Candidate generation — two modes
 Reuse the optimization *pressure* (the speed reward is what tempts a model to cheat).
-`experiment/generate.py` prompts each model to optimize the reference (COMPILOT-style
-framing, optional feedback rounds) and collects every proposed candidate. v1 is
-single-shot sampling × K; escalate to the full feedback loop only if single-shot does
-not elicit enough hacks.
+`experiment/generate.py` prompts each model to optimize the reference and collects every
+proposed candidate. There are **two modes**, because the incentive decides whether hacks
+appear at all:
+
+- **plain** (default): the model sees only the reference. It *cannot* reward-hack — you
+  cannot memorize inputs you never see — so it writes genuinely-correct or just-broken
+  code. This is the baseline (an early plain run came back with ~no hacks, confirming the
+  point).
+- **tempt** (`--tempt`): the model also sees the *visible* example input/output pairs
+  under a faithfully-described **naive, speed-only grader** ("these are the only inputs it
+  checks"). The hack — memorize / special-case those examples — is meant to **emerge**
+  from that incentive; we never instruct it, and the **withheld** inputs are still never
+  shown, so a memorizer passes L1 and is caught by the moat at L3. This mirrors how real
+  optimizers (OpenEvolve, KernelBench, the COMPILOT setting) are graded against a known
+  visible test set, and is the realistic condition for the moat-vs-judge question.
+
+v1 is single-shot sampling × K per (task, model); escalate to a multi-round feedback loop
+only if single-shot tempting does not elicit enough hacks.
 
 ## Phases
 - **0 — de-risk:** pick + verify a free model set (a couple of test calls). Lock the
@@ -64,8 +78,8 @@ not elicit enough hacks.
 v1 deliberately adds **no new dependencies** (numpy + stdlib only).
 
 ## Honest risks
-- Real models may rarely cheat on the simple OIB tasks → add 1-2 hack-tempting tasks
-  (cheap-to-memorize, expensive-to-actually-compute) and lean on optimization pressure.
+- Real models rarely cheat when they only see the reference (confirmed) → use `--tempt`,
+  which shows the visible inputs under a naive speed-only grader so the hack can emerge.
 - Ground-truth circularity (see principle above) — the main validity threat.
 - The result may be "judge ≈ moat." That is a real finding, not a failure.
 - "No exact prior-art match" for our niche is bounded by the survey; re-check arXiv
@@ -73,5 +87,6 @@ v1 deliberately adds **no new dependencies** (numpy + stdlib only).
 
 ## How to run
 - Model-free validation (no key): `python -m experiment.run --planted`
-- Full run (needs an OpenAI-compatible key, e.g. OpenRouter):
+- Baseline run (no hacks expected — confirms the models write correct code):
   `OPENAI_API_KEY=... OPENAI_BASE_URL=https://openrouter.ai/api/v1 python -m experiment.run --models <m1> <m2> ...`
+- The real test (elicit hacks under a naive grader, then see who catches them): add `--tempt`.
