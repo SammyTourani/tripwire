@@ -131,15 +131,13 @@ function Docs() {
             <a className="underline decoration-white/30 hover:decoration-white" href="https://docs.astral.sh/uv/" target="_blank" rel="noreferrer">uv</a>
             , which runs it with no install or clone:
           </p>
-          <p className="text-neutral-400 text-[14px]">Run the latest from GitHub (nothing to install):</p>
+          <p className="text-neutral-400 text-[14px]">Run it with no install:</p>
+          <Code>uvx --from tripwire-oracle tripwire demo</Code>
+          <p className="text-neutral-400 text-[14px]">Or install from PyPI:</p>
+          <Code>{`pip install tripwire-oracle
+tripwire demo`}</Code>
+          <p className="text-neutral-400 text-[14px]">Or run the very latest from GitHub:</p>
           <Code>uvx --from git+https://github.com/SammyTourani/tripwire tripwire demo</Code>
-          <p className="text-neutral-400 text-[14px]">Or install it (from source today; from PyPI once 0.3.0 ships):</p>
-          <Code>{`# install the current CLI from source:
-pip install "git+https://github.com/SammyTourani/tripwire"
-tripwire demo
-
-# once 0.3.0 is published, the released package works the same:
-pip install tripwire-oracle`}</Code>
           <p>
             The distribution is named <span style={{ color: RED }}>tripwire-oracle</span> (the bare
             name “tripwire” is reserved on PyPI), but the command you run is always{" "}
