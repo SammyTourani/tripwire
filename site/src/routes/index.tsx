@@ -22,7 +22,6 @@ import {
   COMPILOT,
 } from "../data/tripwire";
 import { COMPILOT_STATS } from "../data/compilot";
-import Backdrop from "../components/Backdrop";
 import FrameworkDiagram from "../components/charts/FrameworkDiagram";
 import SpeedupChart, { GeomeanBySize } from "../components/charts/SpeedupChart";
 import ScheduleViability from "../components/charts/ScheduleViability";
@@ -110,13 +109,21 @@ function Index() {
     <div className="relative w-full bg-black overflow-hidden">
       {/* Hero */}
       <div className={`relative ${show ? "hero-ready" : ""}`}>
-        {/* full-bleed trajectory field behind the entire hero */}
-        <Backdrop className="absolute inset-0 w-full h-full z-0 pointer-events-none opacity-95" />
+        {/* full-bleed glass video behind the entire hero */}
+        <video
+          className="absolute inset-0 w-full h-full object-cover z-0 pointer-events-none"
+          autoPlay
+          muted
+          loop
+          playsInline
+          preload="auto"
+          src={`${import.meta.env.BASE_URL}tripwire-bg.mp4`}
+        />
         <div
           className="absolute inset-0 z-0 pointer-events-none"
           style={{
             background:
-              "radial-gradient(ellipse 75% 55% at 50% 26%, rgba(0,0,0,0.55), transparent 78%), linear-gradient(to bottom, rgba(0,0,0,0.4), transparent 26%, rgba(0,0,0,0.5) 86%, #000)",
+              "radial-gradient(ellipse 80% 58% at 50% 24%, rgba(0,0,0,0.5), transparent 82%), linear-gradient(to bottom, rgba(0,0,0,0.45), rgba(0,0,0,0.12) 32%, rgba(0,0,0,0.5) 86%, #000)",
           }}
         />
         {/* Header */}
@@ -191,13 +198,13 @@ function Index() {
 
         {/* Macbook window — translucent so the trajectory field shows through.
             Fade only (no translate) so the headline inside isn't moved twice. */}
-        <div className="relative z-10 mt-[10px] mx-[20px] rounded-2xl overflow-hidden anim-fade border border-white/10" style={{ backgroundColor: "rgba(13,12,14,0.42)" }}>
+        <div className="relative z-10 mt-[10px] mx-[20px] rounded-2xl overflow-hidden anim-fade border border-white/10" style={{ backgroundColor: "rgba(11,10,12,0.5)" }}>
           <div className="relative">
             {/* Hero content */}
             <div className="relative overflow-hidden m-4 mb-0 border border-white/10 rounded-2xl flex flex-col items-center text-center pt-[56px] sm:pt-[72px] px-6 pb-0">
               <div className="absolute inset-0 bg-grid z-0 opacity-25" />
               {/* readability scrim directly behind the hero copy */}
-              <div className="absolute inset-0 z-0 pointer-events-none" style={{ background: "radial-gradient(ellipse 72% 62% at 50% 34%, rgba(0,0,0,0.5), transparent 72%)" }} />
+              <div className="absolute inset-0 z-0 pointer-events-none" style={{ background: "radial-gradient(ellipse 85% 75% at 50% 32%, rgba(0,0,0,0.72), transparent 74%)" }} />
 
               <motion.div
                 className="relative z-10 inline-flex items-center gap-2 mb-6"
@@ -246,7 +253,7 @@ function Index() {
                 transition={{ duration: 0.55, delay: 0.95, ease: "easeOut" }}
               >
                 <div className="absolute inset-0 bg-neutral-900/80 outline outline-[1.30px] outline-white/10 rounded-xl flex items-center pl-4 pr-1.5 gap-3">
-                  <span className="text-emerald-400 shrink-0"><Icon path={ICONS.terminal} size={18} /></span>
+                  <span className="text-neutral-400 shrink-0"><Icon path={ICONS.terminal} size={18} /></span>
                   <CommandBar text="python -m bench.run" startDelay={1100} speed={42} />
                   <CopyButton value="python -m bench.run" />
                 </div>

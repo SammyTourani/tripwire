@@ -5,8 +5,8 @@
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
-  --font-sans: "Newsreader", Georgia, "Times New Roman", serif;
-  --font-display: "Playfair Display", Georgia, "Times New Roman", serif;
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-display: "Inter Tight", "Inter", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -25,17 +25,17 @@
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
   }
-  /* headings + the high-contrast Didone display face (Hermes-style) */
+  /* headings + the modern grotesque display face (Inter Tight, tight tracking) */
   h1, h2, h3, h4 {
     font-family: var(--font-display);
     font-weight: 600;
-    letter-spacing: -0.01em;
+    letter-spacing: -0.025em;
   }
   .font-display { font-family: var(--font-display); }
   .font-body { font-family: var(--font-sans); }
   .tnum { font-variant-numeric: tabular-nums; }
-  /* numerals in the display serif with tabular figures */
-  .tabular-nums { font-family: var(--font-display); }
+  /* numerals in the display grotesque with tabular figures */
+  .tabular-nums { font-family: var(--font-display); font-feature-settings: "tnum" 1; }
 }
 
 @keyframes rise-up {
