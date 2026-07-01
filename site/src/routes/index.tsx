@@ -84,6 +84,55 @@ const navItems = [
   { label: "Target zero", href: "#proof", active: false },
 ];
 
+// Hold-to-scroll recording aid: with `?record` in the URL, holding ArrowDown scrolls
+// the page at a constant, buttery-smooth speed (requestAnimationFrame), so the whole
+// landing can be screen-recorded in one take. Opt-in only, so normal visitors keep
+// native keyboard scrolling. Tune the speed with `?record=150` (pixels per second).
+function HoldToScroll() {
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    if (!params.has("record")) return;
+    const speed = Number(params.get("record")) || 200; // px per second
+
+    let scrolling = false;
+    let raf = 0;
+    let last = 0;
+    const step = (now: number) => {
+      if (!scrolling) return;
+      window.scrollBy(0, (speed * (now - last)) / 1000); // move ∝ elapsed time
+      last = now;
+      raf = requestAnimationFrame(step);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "ArrowDown") return;
+      e.preventDefault(); // no native step-scroll layered on top
+      if (!scrolling) {
+        scrolling = true;
+        last = performance.now();
+        raf = requestAnimationFrame(step);
+      }
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === "ArrowDown") scrolling = false;
+    };
+
+    // exact per-frame motion — override any CSS smooth-scrolling
+    const prevBehavior = document.documentElement.style.scrollBehavior;
+    document.documentElement.style.scrollBehavior = "auto";
+    window.addEventListener("keydown", onKeyDown, { passive: false });
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      scrolling = false;
+      cancelAnimationFrame(raf);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      document.documentElement.style.scrollBehavior = prevBehavior;
+    };
+  }, []);
+  return null;
+}
+
 function Index() {
   const [menuOpen, setMenuOpen] = useState(false);
   // Reveal the hero exactly once, after fonts are ready — avoids the SSR-paint /
@@ -107,6 +156,7 @@ function Index() {
   }, []);
   return (
     <div className="relative w-full bg-black overflow-hidden">
+      <HoldToScroll />
       {/* Hero */}
       <div className={`relative ${show ? "hero-ready" : ""}`}>
         {/* full-bleed glass video behind the entire hero */}
