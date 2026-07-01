@@ -134,8 +134,6 @@ A correctness failure (L1/L2/L3) zeroes the score, so a reward-hack can never ea
 
 ## Target zero — a COMPILOT-inspired live loop, with Claude as the proposer
 
-[![live visualizer](docs/assets/site-hero.png)](https://sammytourani.github.io/tripwire/)
-
 `runner/target_zero.py` wires the layered oracle into a real, network-backed OpenEvolve run with **Claude (Opus 4.8)** proposing optimizations of a Python numeric kernel. The recorded run reached a **200×** speedup verified through all four layers; the **[live visualizer](https://sammytourani.github.io/tripwire/)** replays the full trace — candidate code, Claude's reasoning, and the oracle's verdict per iteration — alongside the cross-domain scorecard.
 
 **Honest framing:** this is **COMPILOT-*inspired*, not a COMPILOT reproduction.** COMPILOT (arXiv:2511.00592) optimizes **C loop nests** through the **Tiramisu polyhedral compiler** with **formal legality checking**; target zero optimizes a **Python kernel** judged by Tripwire's **empirical layered oracle**. What it reproduces is the *principle* the paper validates in RQ7 — **delegate correctness to a rigorous verifier rather than trusting the LLM to be correct** — not the system. It also fills a literal gap in the paper: COMPILOT's Table I evaluated Gemini / GPT / o3 / Llama / Gemma / QwQ / Qwen / Codestral, but **never an Anthropic model**.
